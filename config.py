@@ -22,6 +22,16 @@ ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "-1000000000000"))
 _personal_chat_id_env = os.getenv("PERSONAL_CHAT_ID", "")
 PERSONAL_CHAT_ID = int(_personal_chat_id_env) if _personal_chat_id_env.strip() else None
 
+# DB fayli shu chatga vaqti-vaqti bilan hujjat sifatida yuklanib, PIN qilinadi.
+# Render'ning bepul tarifida disk vaqtinchalik (har deploy'da o'chadi),
+# shuning uchun bot ishga tushganda shu yerdan (pin qilingan hujjatdan)
+# bazani avtomatik tiklaydi. Alohida berilmasa, PERSONAL_CHAT_ID ishlatiladi.
+_db_backup_chat_env = os.getenv("DB_BACKUP_CHAT_ID", "")
+if _db_backup_chat_env.strip():
+    DB_BACKUP_CHAT_ID = int(_db_backup_chat_env)
+else:
+    DB_BACKUP_CHAT_ID = PERSONAL_CHAT_ID
+
 # Admin panelidan foydalana oladigan Telegram ID'lar ro'yxati.
 # Deploy qilishda ADMIN_IDS environment variable orqali (vergul bilan
 # ajratilgan holda, masalan "111111,222222") berish tavsiya etiladi,

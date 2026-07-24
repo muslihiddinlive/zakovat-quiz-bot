@@ -84,6 +84,14 @@ async def close_db() -> None:
         _conn = None
 
 
+async def checkpoint() -> None:
+    """WAL rejimida yozilgan o'zgarishlarni asosiy .db fayliga to'liq ko'chiradi.
+    Backup olishdan OLDIN albatta chaqirilishi kerak, aks holda faylda
+    eng so'nggi yozuvlar bo'lmasligi mumkin."""
+    async with _lock:
+        await _conn.execute("PRAGMA wal_checkpoint(FULL);")
+
+
 # ------------------------- USERS -------------------------
 
 async def get_user(tg_id: int):

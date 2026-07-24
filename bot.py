@@ -31,6 +31,7 @@ from aiogram.types import (
     KeyboardButton,
     WebAppInfo,
     BufferedInputFile,
+    FSInputFile,
     TelegramObject,
 )
 
@@ -107,6 +108,7 @@ def admin_panel_kb(tournament_active: bool, active_round: int) -> InlineKeyboard
         callback_data="adm_pick_round",
     )])
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
+    rows.append([InlineKeyboardButton(text="💾 Zaxira olish (qo'lda)", callback_data="adm_backup_now")])
     rows.append([InlineKeyboardButton(text="🗑 Javoblar tarixini tozalash", callback_data="adm_clear_answers")])
     rows.append([InlineKeyboardButton(text="⚠️ To'liq tozalash (userlar ham)", callback_data="adm_clear_all")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -230,6 +232,7 @@ async def process_fullname(message: Message, state: FSMContext):
         reply_markup=await main_menu_kb(),
     )
     await notify_admins_new_registration(message.from_user, full_name)
+    asyncio.create_task(backup_db_to_telegram())
 
 
 async def notify_admins_new_registration(user, full_name: str) -> None:
@@ -529,6 +532,7 @@ async def adm_start(call: CallbackQuery):
         await admin_panel_text(), reply_markup=admin_panel_kb(True, await db.get_active_round())
     )
     await call.answer("Turnir boshlandi! Endi \"🔀 Raund boshlash\"dan birinchi raundni tanlang.")
+    asyncio.create_task(backup_db_to_telegram())
 
 
 @dp.callback_query(F.data == "adm_stop")
@@ -541,6 +545,7 @@ async def adm_stop(call: CallbackQuery):
     )
     await call.answer("Turnir to'xtatildi!")
     await broadcast_to_users("⏹ Turnir vaqtincha to'xtatildi. Admin qayta boshlashini kuting.")
+    asyncio.create_task(backup_db_to_telegram())
 
 
 @dp.callback_query(F.data == "adm_back")
@@ -595,6 +600,7 @@ async def adm_set_round(call: CallbackQuery):
             "Javobingizni \"📤 Javob yuborish\" tugmasi orqali yuboring!"
         )
     await broadcast_to_users(broadcast_text)
+    asyncio.create_task(backup_db_to_telegram())
 
 
 async def broadcast_to_users(text: str) -> None:
@@ -620,6 +626,22 @@ async def adm_export(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     await call.answer("Excel tayyorlanmoqda...")
     await export_answers_to_excel(call.message)
+
+
+@dp.callback_query(F.data == "adm_backup_now")
+async def adm_backup_now(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    if not config.DB_BACKUP_CHAT_ID:
+        await call.answer(
+            "⚠️ DB_BACKUP_CHAT_ID sozlanmagan (PERSONAL_CHAT_ID ham). "
+            "Render'da shu environment variable'ni qo'shing.",
+            show_alert=True,
+        )
+        return
+    await call.answer("💾 Zaxira olinmoqda...")
+    await backup_db_to_telegram()
+    await call.message.answer("✅ Zaxira muvaffaqiyatli olindi va pin qilindi.")
 
 
 @dp.callback_query(F.data == "adm_clear_answers")
@@ -648,6 +670,7 @@ async def adm_clear_answers_go(call: CallbackQuery):
         reply_markup=admin_panel_kb(await db.is_tournament_active(), await db.get_active_round()),
     )
     await call.answer("✅ Javoblar tarixi tozalandi.", show_alert=True)
+    asyncio.create_task(backup_db_to_telegram())
 
 
 @dp.callback_query(F.data == "adm_clear_all")
@@ -677,6 +700,7 @@ async def adm_clear_all_go(call: CallbackQuery):
         await admin_panel_text(), reply_markup=admin_panel_kb(False, 0)
     )
     await call.answer("✅ Barcha ma'lumotlar tozalandi.", show_alert=True)
+    asyncio.create_task(backup_db_to_telegram())
 
 
 async def export_answers_to_excel(message: Message):
@@ -719,10 +743,62 @@ async def export_answers_to_excel(message: Message):
 
 
 # ==================================================================
-#  ISHGA TUSHIRISH
+#  DB BACKUP -> TELEGRAM (Render bepul tarifida disk vaqtinchalik bo'lgani uchun)
 # ==================================================================
 
+async def backup_db_to_telegram() -> None:
+    """Joriy DB faylini DB_BACKUP_CHAT_ID'ga hujjat sifatida yuklaydi va PIN qiladi.
+    Bot qayta ishga tushganda shu pin qilingan fayldan baza tiklanadi."""
+    if not config.DB_BACKUP_CHAT_ID:
+        return
+    try:
+        await db.checkpoint()  # WAL'dagi o'zgarishlarni asosiy faylga ko'chirish
+        file = FSInputFile(db.DB_PATH, filename="zakovat_quiz_backup.db")
+        msg = await bot.send_document(
+            config.DB_BACKUP_CHAT_ID, file,
+            caption=f"💾 Avtomatik zaxira - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            disable_notification=True,
+        )
+        try:
+            await bot.unpin_all_chat_messages(config.DB_BACKUP_CHAT_ID)
+        except Exception:
+            pass  # pin qilingan xabar bo'lmasa ham davom etamiz
+        await bot.pin_chat_message(config.DB_BACKUP_CHAT_ID, msg.message_id, disable_notification=True)
+        logger.info("DB zaxirasi Telegram'ga yuklandi va pin qilindi.")
+    except Exception as e:
+        logger.error(f"DB zaxiralashda xatolik: {e}")
+
+
+async def restore_db_from_telegram() -> None:
+    """Bot ishga tushganda DB_BACKUP_CHAT_ID'dagi pin qilingan zaxira fayldan
+    bazani tiklaydi (agar mavjud bo'lsa). Topilmasa - yangi (bo'sh) baza bilan davom etadi."""
+    if not config.DB_BACKUP_CHAT_ID:
+        logger.info("DB_BACKUP_CHAT_ID sozlanmagan - zaxiradan tiklash o'tkazib yuborildi.")
+        return
+    try:
+        chat = await bot.get_chat(config.DB_BACKUP_CHAT_ID)
+        pinned = chat.pinned_message
+        if pinned and pinned.document:
+            file_info = await bot.get_file(pinned.document.file_id)
+            await bot.download_file(file_info.file_path, destination=db.DB_PATH)
+            logger.info("✅ DB oldingi zaxiradan muvaffaqiyatli tiklandi.")
+        else:
+            logger.info("Pin qilingan zaxira topilmadi - yangi (bo'sh) baza bilan boshlanadi.")
+    except Exception as e:
+        logger.warning(f"DB'ni zaxiradan tiklashda xatolik (yangi baza bilan davom etiladi): {e}")
+
+
+async def periodic_backup_loop() -> None:
+    """Har 2 daqiqada avtomatik zaxira - javoblar oqimida hech narsa yo'qolmasligi uchun."""
+    while True:
+        await asyncio.sleep(120)
+        await backup_db_to_telegram()
+
+
+
+
 async def main():
+    await restore_db_from_telegram()
     await db.init_db()
     logger.info("Bot ishga tushdi...")
     try:
@@ -736,8 +812,10 @@ async def main():
         await asyncio.gather(
             dp.start_polling(bot),
             run_health_server(),
+            periodic_backup_loop(),
         )
     finally:
+        await backup_db_to_telegram()  # to'xtashdan oldin ham oxirgi holatni saqlab qolamiz
         await db.close_db()
 
 
