@@ -270,6 +270,7 @@
     inputArea.disabled = false;
     startTime = null;
     finished = false;
+    pendingResult = null;
     clearInterval(timerInterval);
     timerVal.textContent = "0.0s";
     wpmVal.textContent = "0";
@@ -291,6 +292,8 @@
     }, 100);
   }
 
+  let pendingResult = null;
+
   function finishRound(typed) {
     finished = true;
     clearInterval(timerInterval);
@@ -311,8 +314,11 @@
 
     actionBtn.textContent = "📤 Natijani yuborish";
 
-    // Telegram botga natijani avtomatik yuborish
-    sendResultToBot(finalWpmValue, elapsedSec, typed);
+    // Natijani darhol yubormaymiz - tg.sendData() chaqirilgan zahoti
+    // WebApp avtomatik yopiladi, ya'ni foydalanuvchi natijasini ko'rolmay
+    // qoladi. Shuning uchun natijani saqlab qo'yamiz, foydalanuvchi
+    // "Natijani yuborish" tugmasini bosganda yuboramiz.
+    pendingResult = { wpm: finalWpmValue, timeSec: elapsedSec, typedText: typed };
   }
 
   function sendResultToBot(wpm, timeSec, typedText) {
@@ -322,7 +328,7 @@
       text: typedText,
     };
     if (tg) {
-      tg.sendData(JSON.stringify(payload));
+      tg.sendData(JSON.stringify(payload)); // Bu WebApp'ni avtomatik yopadi
     } else {
       console.log("sendData (test rejimi):", payload);
     }
@@ -346,8 +352,13 @@
 
   actionBtn.addEventListener("click", () => {
     if (finished) {
-      // Natija allaqachon yuborilgan bo'lsa, WebApp'ni yopish
-      if (tg) tg.close();
+      // Foydalanuvchi natijani ko'rib, o'zi "yuborish"ni bosdi.
+      // sendData() chaqirilgach WebApp avtomatik yopiladi.
+      if (pendingResult) {
+        sendResultToBot(pendingResult.wpm, pendingResult.timeSec, pendingResult.typedText);
+      } else if (tg) {
+        tg.close();
+      }
     } else {
       resetRound();
     }
