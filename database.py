@@ -136,6 +136,16 @@ async def get_user_answers(tg_id: int):
         return await cur.fetchall()
 
 
+async def has_answered(tg_id: int, round_num: int) -> bool:
+    """Foydalanuvchi shu raundga allaqachon javob yuborganmi - qayta urinishni oldini olish uchun."""
+    async with _lock:
+        cur = await _conn.execute(
+            "SELECT 1 FROM answers WHERE tg_id = ? AND round_num = ? LIMIT 1",
+            (tg_id, round_num),
+        )
+        return await cur.fetchone() is not None
+
+
 async def get_all_answers():
     """Excel eksport uchun barcha javoblarni foydalanuvchi ma'lumotlari bilan qo'shib qaytaradi."""
     async with _lock:

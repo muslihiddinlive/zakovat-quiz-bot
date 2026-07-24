@@ -299,6 +299,12 @@ async def choose_round(call: CallbackQuery, state: FSMContext):
         return
 
     if round_num == 4:
+        if await db.has_answered(call.from_user.id, 4):
+            await call.answer(
+                "Siz 4-raundda allaqachon ishtirok etgansiz, qayta urinib bo'lmaydi.",
+                show_alert=True,
+            )
+            return
         await call.message.edit_text(
             "⌨️ 4-raund uchun javob Web App orqali avtomatik yuboriladi.\n"
             "Bosh menyudagi \"Tez yozish\" tugmasini bosing."
@@ -428,6 +434,14 @@ async def forward_answer_to_admins(
 async def handle_webapp_data(message: Message):
     if not await db.is_round_enabled(4):
         await message.answer("Bu raund hozir yopiq, natija qabul qilinmadi.")
+        return
+
+    if await db.has_answered(message.from_user.id, 4):
+        await message.answer(
+            "⚠️ Siz 4-raundda allaqachon ishtirok etgansiz. "
+            "Har bir ishtirokchi faqat bir marta urinib ko'ra oladi, "
+            "shuning uchun yangi natija qabul qilinmaydi."
+        )
         return
 
     try:
