@@ -44,9 +44,11 @@ async def init_db() -> None:
                 id            INTEGER PRIMARY KEY AUTOINCREMENT,
                 tg_id         INTEGER NOT NULL,
                 round_num     INTEGER NOT NULL,
-                content_type  TEXT,       -- text / photo / sticker / voice / audio / photo_text
+                content_type  TEXT,       -- text / photo / sticker / voice / audio / photo_text / webapp_typing
                 text_content  TEXT,
                 file_id       TEXT,
+                chat_id       INTEGER,    -- original message manzili (admin "Ko'rish" bosganda shu joydan nusxa oladi)
+                message_id    INTEGER,
                 wpm           REAL,
                 time_sec      REAL,
                 submitted_at  TEXT
@@ -65,11 +67,12 @@ async def init_db() -> None:
         await _conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('tournament_active', '0')"
         )
-        for i in range(1, 8):
-            await _conn.execute(
-                "INSERT OR IGNORE INTO settings (key, value) VALUES (?, '1')",
-                (f"round_{i}_enabled",),
-            )
+        # active_round: 0 = hech qanday raund faol emas. Bir vaqtning
+        # o'zida faqat BITTA raund faol bo'ladi - admin yangi raund
+        # boshlasa, eskisi avtomatik yopiladi.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('active_round', '0')"
+        )
         await _conn.commit()
 
 
@@ -113,19 +116,45 @@ async def add_answer(
     file_id: str | None = None,
     wpm: float | None = None,
     time_sec: float | None = None,
-) -> None:
+    chat_id: int | None = None,
+    message_id: int | None = None,
+) -> int:
+    """Javobni bazaga yozadi va yangi qatorning ID'sini qaytaradi."""
     async with _lock:
-        await _conn.execute(
+        cur = await _conn.execute(
             """
-            INSERT INTO answers (tg_id, round_num, content_type, text_content, file_id, wpm, time_sec, submitted_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO answers
+                (tg_id, round_num, content_type, text_content, file_id, chat_id, message_id, wpm, time_sec, submitted_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                tg_id, round_num, content_type, text_content, file_id, wpm, time_sec,
+                tg_id, round_num, content_type, text_content, file_id, chat_id, message_id, wpm, time_sec,
                 datetime.now().isoformat(timespec="seconds"),
             ),
         )
         await _conn.commit()
+        return cur.lastrowid
+
+
+async def get_answer_by_id(answer_id: int):
+    async with _lock:
+        cur = await _conn.execute(
+            """
+            SELECT a.*, u.full_name, u.username
+            FROM answers a LEFT JOIN users u ON u.tg_id = a.tg_id
+            WHERE a.id = ?
+            """,
+            (answer_id,),
+        )
+        return await cur.fetchone()
+
+
+async def get_all_user_ids() -> list[int]:
+    """Broadcast (masalan, yangi raund boshlanganini xabar qilish) uchun barcha ro'yxatdan o'tgan foydalanuvchilar."""
+    async with _lock:
+        cur = await _conn.execute("SELECT tg_id FROM users")
+        rows = await cur.fetchall()
+        return [r[0] for r in rows]
 
 
 async def get_user_answers(tg_id: int):
@@ -187,16 +216,50 @@ async def is_tournament_active() -> bool:
 
 async def set_tournament_active(active: bool) -> None:
     await set_setting("tournament_active", "1" if active else "0")
+    if not active:
+        # Turnir to'xtatilganda faol raund ham yopiladi
+        await set_setting("active_round", "0")
+
+
+async def get_active_round() -> int:
+    """Hozir javob qabul qilinayotgan yagona raund raqami (0 = hech qaysi faol emas)."""
+    val = await get_setting("active_round")
+    try:
+        return int(val) if val else 0
+    except ValueError:
+        return 0
+
+
+async def set_active_round(round_num: int) -> None:
+    """Yangi raundni faol qiladi - shu bilan avvalgi faol raund AVTOMATIK yopiladi
+    (chunki bir vaqtning o'zida faqat bitta raund faol bo'lishi mumkin)."""
+    await set_setting("active_round", str(round_num))
 
 
 async def is_round_enabled(round_num: int) -> bool:
-    val = await get_setting(f"round_{round_num}_enabled")
-    return val == "1"
+    """Faqat hozirgi faol raund uchun True qaytaradi."""
+    return await get_active_round() == round_num
 
 
-async def toggle_round(round_num: int) -> bool:
-    """Raund holatini teskarisiga o'zgartiradi va yangi holatni qaytaradi."""
-    current = await is_round_enabled(round_num)
-    new_val = "0" if current else "1"
-    await set_setting(f"round_{round_num}_enabled", new_val)
-    return new_val == "1"
+async def clear_answers() -> None:
+    """Faqat javoblar tarixini tozalaydi (ro'yxatdan o'tganlar saqlanib qoladi)."""
+    async with _lock:
+        await _conn.execute("DELETE FROM answers")
+        await _conn.commit()
+
+
+async def clear_all_data() -> None:
+    """Botning barcha ma'lumotlarini (foydalanuvchilar + javoblar) butunlay tozalaydi,
+    turnir holatini ham boshlang'ich holatga qaytaradi. QAYTARIB BO'LMAYDI."""
+    async with _lock:
+        await _conn.execute("DELETE FROM answers")
+        await _conn.execute("DELETE FROM users")
+        await _conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('tournament_active', '0') "
+            "ON CONFLICT(key) DO UPDATE SET value = '0'"
+        )
+        await _conn.execute(
+            "INSERT INTO settings (key, value) VALUES ('active_round', '0') "
+            "ON CONFLICT(key) DO UPDATE SET value = '0'"
+        )
+        await _conn.commit()
