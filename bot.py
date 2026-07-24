@@ -44,6 +44,13 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
+# Raund raqamlarini "kind" bo'yicha oldindan aniqlab olamiz - shunda kodda
+# hech qayerda "4-raund" kabi qattiq yozilgan raqamlar ishlatilmaydi,
+# raundlar tartibi o'zgarsa ham hammasi to'g'ri ishlayveradi.
+WEBAPP_ROUND = next((n for n, i in config.ROUNDS.items() if i.get("kind") == "webapp"), None)
+STICKER_ROUND = next((n for n, i in config.ROUNDS.items() if i.get("kind") == "sticker"), None)
+EXTERNAL_ROUNDS = {n for n, i in config.ROUNDS.items() if i.get("kind") == "external"}
+
 
 # ==================================================================
 #  FSM HOLATLARI
@@ -55,6 +62,11 @@ class RegisterStates(StatesGroup):
 
 class AnswerStates(StatesGroup):
     waiting_answer = State()
+
+
+class AdminStickerAnnounceStates(StatesGroup):
+    waiting_sticker = State()
+    waiting_caption = State()
 
 
 # ==================================================================
@@ -75,7 +87,7 @@ async def main_menu_kb() -> ReplyKeyboardMarkup:
     rows = []
     if tournament_active and active_round:
         rows.append([KeyboardButton(text="📤 Javob yuborish")])
-        if active_round == 4:
+        if active_round == WEBAPP_ROUND:
             rows.append(
                 [KeyboardButton(text="⌨️ Tez yozish (Web App)", web_app=WebAppInfo(url=config.WEBAPP_URL))]
             )
@@ -122,6 +134,29 @@ def admin_round_picker_kb() -> InlineKeyboardMarkup:
     ]
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+# ==================================================================
+#  KANALGA E'LON YUBORISH (bot @ParadoksHub kanalida admin huquqiga ega)
+# ==================================================================
+
+async def post_text_to_channel(text: str) -> None:
+    """Kanalga oddiy matnli e'lon yuboradi."""
+    try:
+        await bot.send_message(config.CHANNEL_ID, text)
+    except Exception as e:
+        logger.error(f"Kanalga xabar yuborishda xatolik: {e}")
+
+
+async def post_sticker_to_channel(sticker_file_id: str, caption: str | None = None) -> None:
+    """Kanalga stiker, so'ng (agar berilsa) tarif matnini alohida xabar sifatida yuboradi
+    (Telegram stikerlarda caption maydoni yo'q, shuning uchun ikkita xabar bo'ladi)."""
+    try:
+        await bot.send_sticker(config.CHANNEL_ID, sticker=sticker_file_id)
+        if caption:
+            await bot.send_message(config.CHANNEL_ID, caption)
+    except Exception as e:
+        logger.error(f"Kanalga stiker yuborishda xatolik: {e}")
 
 
 # ==================================================================
@@ -262,12 +297,15 @@ async def notify_admins_new_registration(user, full_name: str) -> None:
 @dp.message(F.text == "ℹ️ Qoidalar")
 async def show_rules(message: Message):
     rounds_text = "\n".join(f"{num}. {info['name']}" for num, info in config.ROUNDS.items())
+    webapp_info = config.ROUNDS.get(WEBAPP_ROUND, {}).get("name", "")
+    external_names = ", ".join(config.ROUNDS[n]["name"] for n in sorted(EXTERNAL_ROUNDS))
     await message.answer(
         "📜 <b>Zakovat Quiz - Qoidalar</b>\n\n"
         f"Turnir {len(config.ROUNDS)} ta raunddan iborat:\n{rounds_text}\n\n"
         "Har bir raund uchun topshiriq kanal/guruhga e'lon qilinadi. "
         "Javobingizni esa aynan shu botga \"📤 Javob yuborish\" tugmasi orqali yuboring.\n\n"
-        "⌨️ 4-raund (Tez yozish) uchun Web App orqali o'yin ochiladi va natija avtomatik yuboriladi."
+        f"⌨️ <b>{webapp_info}</b> uchun Web App orqali o'yin ochiladi va natija avtomatik yuboriladi.\n"
+        f"⚠️ <b>{external_names}</b> - bular botda emas, kanal/guruh muhokamasida o'tkaziladi."
     )
 
 
@@ -306,7 +344,13 @@ async def start_answer_flow(message: Message, state: FSMContext):
         await message.answer("Hozircha faol raund yo'q. Admin raund boshlashini kuting.")
         return
 
-    if round_num == 4:
+    if round_num in EXTERNAL_ROUNDS:
+        await message.answer(
+            f"ℹ️ <b>{config.ROUNDS[round_num]['name']}</b>\n\n{config.ROUNDS[round_num]['hint']}"
+        )
+        return
+
+    if round_num == WEBAPP_ROUND:
         await message.answer(
             "⌨️ Hozirgi faol raund - Tez yozish (Web App). "
             "Javob yuborish uchun bosh menyudagi \"⌨️ Tez yozish\" tugmasidan foydalaning."
@@ -443,13 +487,13 @@ async def adm_view_answer(call: CallbackQuery):
 
 @dp.message(F.content_type == ContentType.WEB_APP_DATA)
 async def handle_webapp_data(message: Message):
-    if not await db.is_round_enabled(4):
+    if not await db.is_round_enabled(WEBAPP_ROUND):
         await message.answer("Bu raund hozir yopiq, natija qabul qilinmadi.")
         return
 
-    if await db.has_answered(message.from_user.id, 4):
+    if await db.has_answered(message.from_user.id, WEBAPP_ROUND):
         await message.answer(
-            "⚠️ Siz 4-raundda allaqachon ishtirok etgansiz. "
+            "⚠️ Siz bu raundda allaqachon ishtirok etgansiz. "
             "Har bir ishtirokchi faqat bir marta urinib ko'ra oladi, "
             "shuning uchun yangi natija qabul qilinmaydi."
         )
@@ -467,7 +511,7 @@ async def handle_webapp_data(message: Message):
 
     await db.add_answer(
         tg_id=message.from_user.id,
-        round_num=4,
+        round_num=WEBAPP_ROUND,
         content_type="webapp_typing",
         text_content=typed_text,
         wpm=wpm,
@@ -483,7 +527,7 @@ async def handle_webapp_data(message: Message):
     safe_full_name = html.escape(user.full_name or "")
     safe_username = html.escape(user.username) if user.username else "yoq"
     result_text = (
-        f"#Raund_4\n"
+        f"#Raund_{WEBAPP_ROUND}\n"
         f"👤 Qatnashchi: {safe_full_name} (@{safe_username}, ID: {user.id})\n"
         f"⌨️ WPM: {wpm:.1f} | Vaqt: {time_sec:.1f}s"
     )
@@ -532,6 +576,7 @@ async def adm_start(call: CallbackQuery):
         await admin_panel_text(), reply_markup=admin_panel_kb(True, await db.get_active_round())
     )
     await call.answer("Turnir boshlandi! Endi \"🔀 Raund boshlash\"dan birinchi raundni tanlang.")
+    await post_text_to_channel("🎉 <b>Zakovat Quiz turniri boshlandi!</b>\nRaundlar birma-bir e'lon qilinadi, tayyor turing!")
     asyncio.create_task(backup_db_to_telegram())
 
 
@@ -544,7 +589,9 @@ async def adm_stop(call: CallbackQuery):
         await admin_panel_text(), reply_markup=admin_panel_kb(False, 0)
     )
     await call.answer("Turnir to'xtatildi!")
-    await broadcast_to_users("⏹ Turnir vaqtincha to'xtatildi. Admin qayta boshlashini kuting.")
+    end_text = "🏁 Turnir yakunlandi! Rahmat, barchangizga!\n🏆 G'oliblar ERTAGA e'lon qilinadi!"
+    await broadcast_to_users(end_text)
+    await post_text_to_channel(end_text)
     asyncio.create_task(backup_db_to_telegram())
 
 
@@ -569,37 +616,110 @@ async def adm_pick_round(call: CallbackQuery):
     await call.message.edit_text(
         "🔀 <b>Qaysi raundni faol qilmoqchisiz?</b>\n\n"
         "⚠️ Yangi raund tanlanishi bilan hozirgi faol raund AVTOMATIK yopiladi "
-        "va foydalanuvchilarga xabar (+ yangilangan tugmalar) yuboriladi.",
+        "va foydalanuvchilarga hamda kanalga xabar yuboriladi.",
         reply_markup=admin_round_picker_kb(),
     )
     await call.answer()
 
 
 @dp.callback_query(F.data.startswith("adm_setround_"))
-async def adm_set_round(call: CallbackQuery):
+async def adm_set_round(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return await call.answer("⛔️", show_alert=True)
     round_num = int(call.data.split("_")[-1])
-    await db.set_active_round(round_num)
+    info = config.ROUNDS[round_num]
 
+    if round_num == STICKER_ROUND:
+        # Sticker Battle - avval admin'dan e'lon qilinadigan STIKER so'raymiz,
+        # raund faqat shundan keyin (stiker+tarif kanalga ketgach) faollashadi.
+        await state.update_data(pending_round_num=round_num)
+        await state.set_state(AdminStickerAnnounceStates.waiting_sticker)
+        await call.message.edit_text(
+            f"😂 <b>{info['name']}</b>\n\n"
+            "Kanalga e'lon qilish uchun avval STIKERNI yuboring 👇"
+        )
+        await call.answer()
+        return
+
+    await db.set_active_round(round_num)
     await call.message.edit_text(
         await admin_panel_text(), reply_markup=admin_panel_kb(True, round_num)
     )
-    await call.answer(f"{config.ROUNDS[round_num]['name']} boshlandi!")
+    await call.answer(f"{info['name']} boshlandi!")
 
-    info = config.ROUNDS[round_num]
-    if round_num == 4:
-        broadcast_text = (
+    if round_num == WEBAPP_ROUND:
+        text = (
             f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
             "Bosh menyudagi \"⌨️ Tez yozish\" tugmasini bosib ishtirok eting!"
         )
+    elif round_num in EXTERNAL_ROUNDS:
+        text = (
+            f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
+            f"{info['hint']}"
+        )
     else:
-        broadcast_text = (
+        text = (
             f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
             f"{info['hint']}\n\n"
             "Javobingizni \"📤 Javob yuborish\" tugmasi orqali yuboring!"
         )
-    await broadcast_to_users(broadcast_text)
+    await broadcast_to_users(text)
+    await post_text_to_channel(text)
+    asyncio.create_task(backup_db_to_telegram())
+
+
+@dp.message(StateFilter(AdminStickerAnnounceStates.waiting_sticker), F.sticker)
+async def adm_sticker_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.update_data(sticker_file_id=message.sticker.file_id)
+    await state.set_state(AdminStickerAnnounceStates.waiting_caption)
+    await message.answer("✏️ Endi shu stikerga tarif (izoh) matnini yuboring:")
+
+
+@dp.message(StateFilter(AdminStickerAnnounceStates.waiting_sticker))
+async def adm_sticker_wrong_type(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("❗️ Iltimos, aynan STIKER yuboring (matn emas).")
+
+
+@dp.message(StateFilter(AdminStickerAnnounceStates.waiting_caption), F.text)
+async def adm_sticker_caption_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    round_num = data.get("pending_round_num")
+    sticker_file_id = data.get("sticker_file_id")
+    caption = message.text
+    await state.clear()
+
+    info = config.ROUNDS[round_num]
+    await db.set_active_round(round_num)
+
+    # Kanalga: stiker + tarif
+    await post_sticker_to_channel(sticker_file_id, caption=f"🎬 {info['name']}\n\n{caption}")
+    # Ro'yxatdan o'tgan foydalanuvchilarga ham bir xil tarzda
+    try:
+        kb = await main_menu_kb()
+        for tg_id in await db.get_all_user_ids():
+            try:
+                await bot.send_sticker(tg_id, sticker=sticker_file_id)
+                await bot.send_message(
+                    tg_id, f"🎬 <b>{info['name']}</b>\n\n{caption}\n\n"
+                    "Javobingizni \"📤 Javob yuborish\" orqali stiker sifatida yuboring!",
+                    reply_markup=kb,
+                )
+            except Exception as e:
+                logger.warning(f"Sticker broadcast {tg_id}'ga yetmadi: {e}")
+            await asyncio.sleep(0.05)
+    except Exception as e:
+        logger.error(f"Sticker broadcast xatosi: {e}")
+
+    await message.answer(
+        f"✅ {info['name']} boshlandi va kanalga e'lon qilindi!",
+        reply_markup=admin_panel_kb(True, round_num),
+    )
     asyncio.create_task(backup_db_to_telegram())
 
 
@@ -618,6 +738,8 @@ async def broadcast_to_users(text: str) -> None:
             logger.warning(f"Broadcast {tg_id}'ga yetmadi: {e}")
         await asyncio.sleep(0.05)  # Telegram rate-limit'iga tegmaslik uchun
     logger.info(f"Broadcast yuborildi: {sent} muvaffaqiyatli, {failed} muvaffaqiyatsiz.")
+
+
 
 
 @dp.callback_query(F.data == "adm_export")

@@ -47,13 +47,23 @@ else:
 # "Tez yozish" Web App joylashgan manzil (Render/GitHub Pages/Netlify'ga statik host qilinadi)
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://sizning-domeningiz.com/web_app/index.html")
 
-# Turnirdagi barcha raundlar
+# Turnirdagi barcha raundlar (kanaldagi e'lon tartibida).
+#
+# "kind" maydoni botning har raundga qanday munosabatda bo'lishini belgilaydi:
+#   "photo"     - oddiy javob oqimi (rasm/matn/stiker/ovoz - botda javob yig'iladi)
+#   "webapp"    - "Tez yozish" Web App orqali ishlaydi
+#   "sticker"   - Sticker Battle: raund boshlanganda admin stiker+tarif yuboradi,
+#                 bot uni kanalga e'lon qiladi; foydalanuvchilar botga stiker yuboradi
+#   "external"  - bot bu raundni UMUMAN boshqarmaydi (boshqa bot yoki guruh
+#                 muhokamasida o'tkaziladi, admin ballarni qo'lda kiritadi/hisoblaydi).
+#                 Bot faqat kanalga/foydalanuvchilarga e'lon qiladi, javob yig'maydi.
 ROUNDS = {
-    1: {"name": "🖼 Rasmni ta'riflash", "hint": "Rasm yoki Rasm + Ta'rif (matn) yuboring"},
-    2: {"name": "🎨 Mavzuga rasm",       "hint": "Faqat Rasm/Fayl yuboring"},
-    3: {"name": "🏆 Rasm Battle",        "hint": "Faqat Rasm yuboring"},
-    4: {"name": "⌨️ Tez yozish (Web App)", "hint": "Bosh menyudagi 'Tez yozish' tugmasidan foydalaning"},
-    5: {"name": "😂 Sticker Battle",     "hint": "Stiker yuboring"},
-    6: {"name": "⚽ Futbol Sticker Quiz", "hint": "Stiker yoki matn yuboring"},
-    7: {"name": "🎵 Musiqani top",       "hint": "Matn yoki Ovozli xabar yuboring"},
+    1: {"name": "🖼 Rasmni ta'riflash",   "hint": "Rasm yoki Rasm + Ta'rif (matn) yuboring", "kind": "photo"},
+    2: {"name": "🎨 Mavzuga rasm",         "hint": "Faqat Rasm/Fayl yuboring", "kind": "photo"},
+    3: {"name": "🏆 Rasm Battle",          "hint": "Faqat Rasm yuboring", "kind": "photo"},
+    4: {"name": "🧮 Matematika Rush",      "hint": "Bu raund kanal muhokamasida BOSHQA BOT orqali o'tkaziladi. Botda javob yuborish shart emas.", "kind": "external"},
+    5: {"name": "⌨️ Tez yozish (Web App)", "hint": "Bosh menyudagi 'Tez yozish' tugmasidan foydalaning", "kind": "webapp"},
+    6: {"name": "😂 Sticker Battle",       "hint": "Stiker yuboring", "kind": "sticker"},
+    7: {"name": "⚽ Futbol Sticker Quiz",  "hint": "Bu raund GURUHDA o'tkaziladi, admin ballarni qo'lda hisoblaydi. Botda javob yuborish shart emas.", "kind": "external"},
+    8: {"name": "🎵 Musiqani top",         "hint": "Musiqa/audio faylini yuboring", "kind": "photo"},
 }
