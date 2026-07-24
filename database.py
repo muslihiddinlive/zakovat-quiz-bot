@@ -165,6 +165,13 @@ async def get_all_user_ids() -> list[int]:
         return [r[0] for r in rows]
 
 
+async def get_all_users():
+    """Admin panelda ro'yxatdan o'tganlar ro'yxatini ko'rsatish uchun to'liq ma'lumot."""
+    async with _lock:
+        cur = await _conn.execute("SELECT * FROM users ORDER BY registered_at DESC")
+        return await cur.fetchall()
+
+
 async def get_user_answers(tg_id: int):
     async with _lock:
         cur = await _conn.execute(

@@ -60,13 +60,13 @@ class RegisterStates(StatesGroup):
     waiting_fullname = State()
 
 
-class AnswerStates(StatesGroup):
-    waiting_answer = State()
-
-
 class AdminStickerAnnounceStates(StatesGroup):
     waiting_sticker = State()
     waiting_caption = State()
+
+
+class AdminMessageUserStates(StatesGroup):
+    waiting_message = State()
 
 
 # ==================================================================
@@ -78,7 +78,7 @@ async def main_menu_kb() -> ReplyKeyboardMarkup:
 
     - Turnir hali boshlanmagan bo'lsa: faqat "Qoidalar" va "Natijalarim" ko'rinadi.
     - Turnir boshlangan bo'lsa: "Javob yuborish" qo'shiladi.
-    - Faol raund aynan 4-raund (Web App) bo'lsagina "Tez yozish" tugmasi chiqadi -
+    - Faol raund Web App raundi bo'lsagina "Tez yozish" tugmasi chiqadi -
       ya'ni admin shu raundni boshlamaguncha, WebApp tugmasi umuman ko'rinmaydi.
     """
     tournament_active = await db.is_tournament_active()
@@ -120,6 +120,7 @@ def admin_panel_kb(tournament_active: bool, active_round: int) -> InlineKeyboard
         callback_data="adm_pick_round",
     )])
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
+    rows.append([InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="adm_users_0")])
     rows.append([InlineKeyboardButton(text="💾 Zaxira olish (qo'lda)", callback_data="adm_backup_now")])
     rows.append([InlineKeyboardButton(text="🗑 Javoblar tarixini tozalash", callback_data="adm_clear_answers")])
     rows.append([InlineKeyboardButton(text="⚠️ To'liq tozalash (userlar ham)", callback_data="adm_clear_all")])
@@ -330,8 +331,16 @@ async def my_results(message: Message):
 #  JAVOB YUBORISH OQIMI
 # ==================================================================
 
+RESERVED_MENU_TEXTS = {"📤 Javob yuborish", "ℹ️ Qoidalar", "📊 Mening natijalarim"}
+
+
 @dp.message(F.text == "📤 Javob yuborish")
-async def start_answer_flow(message: Message, state: FSMContext):
+async def show_answer_prompt(message: Message):
+    """Eslatma/ma'lumot beradi - FSM holatiga o'tkazmaydi. Javobni istalgan
+    payt to'g'ridan-to'g'ri (matn/rasm/stiker/ovoz) yuborish mumkin - bu
+    pastdagi 'receive_answer' orqali FSM holatisiz qabul qilinadi, shuning
+    uchun bot qayta ishga tushib qolsa ham (Render deploy va h.k.) hech
+    qanday javob yo'qolib qolmaydi."""
     if not await db.is_registered(message.from_user.id):
         await message.answer("Avval /start orqali ro'yxatdan o'ting.")
         return
@@ -362,71 +371,10 @@ async def start_answer_flow(message: Message, state: FSMContext):
         return
 
     info = config.ROUNDS[round_num]
-    await state.update_data(round_num=round_num)
-    await state.set_state(AnswerStates.waiting_answer)
     await message.answer(
         f"✏️ <b>{info['name']}</b>\n\n"
         f"{info['hint']}\n\n"
-        "Javobingizni pastga yuboring 👇"
-    )
-
-
-@dp.message(
-    StateFilter(AnswerStates.waiting_answer),
-    F.content_type.in_({
-        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
-        ContentType.VOICE, ContentType.AUDIO,
-    }),
-)
-async def receive_answer(message: Message, state: FSMContext):
-    data = await state.get_data()
-    round_num = data.get("round_num")
-    if round_num is None:
-        await state.clear()
-        return
-
-    content_type = None
-    text_content = None
-    file_id = None
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        if message.caption:
-            content_type = "photo_text"
-            text_content = message.caption
-        else:
-            content_type = "photo"
-    elif message.sticker:
-        content_type = "sticker"
-        file_id = message.sticker.file_id
-    elif message.voice:
-        content_type = "voice"
-        file_id = message.voice.file_id
-    elif message.audio:
-        content_type = "audio"
-        file_id = message.audio.file_id
-    elif message.text:
-        content_type = "text"
-        text_content = message.text
-
-    answer_id = await db.add_answer(
-        tg_id=message.from_user.id,
-        round_num=round_num,
-        content_type=content_type,
-        text_content=text_content,
-        file_id=file_id,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-    )
-
-    await state.clear()
-    await message.answer(
-        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
-        reply_markup=await main_menu_kb(),
-    )
-
-    await notify_admins_new_answer(
-        answer_id=answer_id, user=message.from_user, round_num=round_num, content_type=content_type,
+        "Javobingizni pastga to'g'ridan-to'g'ri yuboring 👇"
     )
 
 
@@ -738,6 +686,174 @@ async def broadcast_to_users(text: str) -> None:
             logger.warning(f"Broadcast {tg_id}'ga yetmadi: {e}")
         await asyncio.sleep(0.05)  # Telegram rate-limit'iga tegmaslik uchun
     logger.info(f"Broadcast yuborildi: {sent} muvaffaqiyatli, {failed} muvaffaqiyatsiz.")
+
+
+@dp.message(StateFilter(AdminMessageUserStates.waiting_message), F.text)
+async def adm_msguser_send(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    target_id = data.get("target_tg_id")
+    await state.clear()
+    if not target_id:
+        return
+    try:
+        await bot.send_message(target_id, f"📩 <b>Admindan xabar:</b>\n\n{html.escape(message.text)}")
+        await message.answer("✅ Xabar yuborildi.")
+    except Exception as e:
+        logger.error(f"Foydalanuvchiga xabar yuborishda xatolik: {e}")
+        await message.answer("❌ Xabar yuborilmadi (ehtimol foydalanuvchi botni bloklagan yoki hech qachon /start bosmagan).")
+
+
+# ==================================================================
+#  JAVOBNI QABUL QILISH - FSM HOLATISIZ (muhim!)
+#
+#  Oldingi versiyada javob yuborish "kutish holati" (FSM) ga bog'liq edi.
+#  MemoryStorage botning operativ xotirasida saqlanadi va bot qayta ishga
+#  tushganda (masalan har deploy'da) BUTUNLAY o'chib ketadi - shu sabab
+#  "tugmani bosgan, lekin ulgurmagan" foydalanuvchilarning javoblari
+#  yo'qolib qolardi. Endi javob HECH QANDAY holatga bog'liq emas -
+#  ro'yxatdan o'tgan foydalanuvchi mos formatda(matn/rasm/stiker/ovoz)
+#  xabar yuborsa, faol raund uchun to'g'ridan-to'g'ri qabul qilinadi.
+# ==================================================================
+
+@dp.message(
+    F.content_type.in_({
+        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
+        ContentType.VOICE, ContentType.AUDIO,
+    })
+)
+async def receive_answer(message: Message):
+    # Adminlarning o'zaro suhbati/buyruqlari tasodifan "javob" sifatida
+    # yozilib qolmasligi uchun adminlarni bu handlerdan chetlab o'tamiz.
+    if is_admin(message.from_user.id):
+        return
+    if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
+        return
+
+    if not await db.is_registered(message.from_user.id):
+        return  # ro'yxatdan o'tmagan - sukut (spam bo'lmasin)
+    if not await db.is_tournament_active():
+        return
+    round_num = await db.get_active_round()
+    if not round_num or round_num in EXTERNAL_ROUNDS or round_num == WEBAPP_ROUND:
+        return
+    if await db.has_answered(message.from_user.id, round_num):
+        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
+        return
+
+    content_type = None
+    text_content = None
+    file_id = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        if message.caption:
+            content_type = "photo_text"
+            text_content = message.caption
+        else:
+            content_type = "photo"
+    elif message.sticker:
+        content_type = "sticker"
+        file_id = message.sticker.file_id
+    elif message.voice:
+        content_type = "voice"
+        file_id = message.voice.file_id
+    elif message.audio:
+        content_type = "audio"
+        file_id = message.audio.file_id
+    elif message.text:
+        content_type = "text"
+        text_content = message.text
+    else:
+        return
+
+    answer_id = await db.add_answer(
+        tg_id=message.from_user.id,
+        round_num=round_num,
+        content_type=content_type,
+        text_content=text_content,
+        file_id=file_id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+    await message.answer(
+        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
+        reply_markup=await main_menu_kb(),
+    )
+
+    await notify_admins_new_answer(
+        answer_id=answer_id, user=message.from_user, round_num=round_num, content_type=content_type,
+    )
+
+
+# ==================================================================
+#  ADMIN: RO'YXATDAN O'TGANLAR RO'YXATI + ULARGA TO'G'RIDAN-TO'G'RI YOZISH
+# ==================================================================
+
+@dp.callback_query(F.data.startswith("adm_users"))
+async def adm_users_list(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+
+    parts = call.data.split("_")
+    page = int(parts[-1]) if parts[-1].isdigit() else 0
+
+    users = await db.get_all_users()
+    per_page = 10
+    total_pages = max(1, (len(users) + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    chunk = users[page * per_page: (page + 1) * per_page]
+
+    rows = []
+    for u in chunk:
+        uname = f" (@{u['username']})" if u["username"] and u["username"] != "yo'q" else ""
+        rows.append([InlineKeyboardButton(
+            text=f"👤 {u['full_name']}{uname}", callback_data=f"adm_msguser_{u['tg_id']}"
+        )])
+
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="⬅️", callback_data=f"adm_users_{page - 1}"))
+    nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="noop"))
+    if page < total_pages - 1:
+        nav.append(InlineKeyboardButton(text="➡️", callback_data=f"adm_users_{page + 1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
+
+    if not users:
+        text = "👥 Hozircha ro'yxatdan o'tgan foydalanuvchi yo'q."
+    else:
+        text = f"👥 <b>Ro'yxatdan o'tganlar</b> - jami {len(users)} kishi\n\nBirortasini bosib, unga to'g'ridan-to'g'ri xabar yozing:"
+
+    await call.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def noop_cb(call: CallbackQuery):
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_msguser_"))
+async def adm_msguser_start(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    target_id = int(call.data.split("_")[-1])
+    user = await db.get_user(target_id)
+    if not user:
+        await call.answer("Foydalanuvchi topilmadi.", show_alert=True)
+        return
+
+    await state.update_data(target_tg_id=target_id)
+    await state.set_state(AdminMessageUserStates.waiting_message)
+    await call.message.edit_text(
+        f"✉️ <b>{html.escape(user['full_name'])}</b>ga yubormoqchi bo'lgan xabaringizni yozing:\n\n"
+        "(Bekor qilish uchun /admin bosing)"
+    )
+    await call.answer()
 
 
 
