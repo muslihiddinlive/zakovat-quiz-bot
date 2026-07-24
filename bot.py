@@ -520,12 +520,21 @@ async def adm_start(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("⛔️", show_alert=True)
     await db.set_tournament_active(True)
-    await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(True, await db.get_active_round())
-    )
-    await call.answer("Turnir boshlandi! Endi \"🔀 Raund boshlash\"dan birinchi raundni tanlang.")
+    await call.answer("✅ Turnir boshlandi!")
     await post_text_to_channel("🎉 <b>Zakovat Quiz turniri boshlandi!</b>\nRaundlar birma-bir e'lon qilinadi, tayyor turing!")
     asyncio.create_task(backup_db_to_telegram())
+
+    # MUHIM: turnir "boshlangani" hali hech qanday raund faol degani emas!
+    # Shuning uchun darhol raund tanlash menyusini ochamiz - admin buni
+    # o'tkazib yubormasligi uchun (aks holda "📤 Javob yuborish" tugmasi
+    # hech qachon chiqmaydi va foydalanuvchilar javob yubora olmaydi).
+    await call.message.edit_text(
+        "✅ Turnir boshlandi!\n\n"
+        "⚠️ <b>Diqqat: hozircha hech qanday raund faol emas.</b>\n"
+        "Foydalanuvchilarda \"📤 Javob yuborish\" tugmasi chiqishi uchun "
+        "pastdan BIRINCHI raundni tanlang 👇",
+        reply_markup=admin_round_picker_kb(),
+    )
 
 
 @dp.callback_query(F.data == "adm_stop")
