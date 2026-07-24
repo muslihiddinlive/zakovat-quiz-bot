@@ -1,0 +1,4 @@
+__pycache__/
+*.pyc
+zakovat_quiz.db
+.env

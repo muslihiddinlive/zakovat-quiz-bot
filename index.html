@@ -1,0 +1,361 @@
+<!DOCTYPE html>
+<html lang="uz">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<title>Tez Yozish - Zakovat Quiz</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    --tg-bg: var(--tg-theme-bg-color, #0f1117);
+    --tg-text: var(--tg-theme-text-color, #ffffff);
+    --tg-hint: var(--tg-theme-hint-color, #8b93a1);
+    --tg-button: var(--tg-theme-button-color, #6c5ce7);
+    --tg-button-text: var(--tg-theme-button-text-color, #ffffff);
+    --accent: #6c5ce7;
+    --accent-2: #00d2ff;
+    --danger: #ff5c72;
+    --success: #2ecc71;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at top, #1b1f2e 0%, #0f1117 70%);
+    color: var(--tg-text);
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  .card {
+    width: 100%;
+    max-width: 480px;
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 20px;
+    padding: 24px 20px 28px;
+    backdrop-filter: blur(10px);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.4);
+  }
+
+  h1 {
+    font-size: 20px;
+    text-align: center;
+    margin: 0 0 4px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    -webkit-background-clip: text;
+    background-clip: text;
+    color: transparent;
+  }
+
+  .subtitle {
+    text-align: center;
+    color: var(--tg-hint);
+    font-size: 13px;
+    margin-bottom: 20px;
+  }
+
+  .stats {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 16px;
+    gap: 10px;
+  }
+
+  .stat-box {
+    flex: 1;
+    background: rgba(255,255,255,0.05);
+    border-radius: 12px;
+    padding: 10px 8px;
+    text-align: center;
+  }
+
+  .stat-box .label { font-size: 11px; color: var(--tg-hint); margin-bottom: 4px; }
+  .stat-box .value { font-size: 18px; font-weight: 700; }
+
+  .text-display {
+    background: rgba(0,0,0,0.35);
+    border-radius: 14px;
+    padding: 16px;
+    font-size: 17px;
+    line-height: 1.7;
+    min-height: 110px;
+    margin-bottom: 14px;
+    letter-spacing: 0.2px;
+  }
+
+  .char-correct { color: var(--success); }
+  .char-wrong { color: var(--danger); text-decoration: underline; }
+  .char-pending { color: var(--tg-hint); }
+  .char-current { background: var(--accent); color: #fff; border-radius: 3px; }
+
+  textarea {
+    width: 100%;
+    min-height: 90px;
+    resize: none;
+    border-radius: 14px;
+    border: 2px solid rgba(255,255,255,0.1);
+    background: rgba(255,255,255,0.03);
+    color: var(--tg-text);
+    padding: 12px 14px;
+    font-size: 16px;
+    outline: none;
+    transition: border-color 0.2s;
+  }
+
+  textarea:focus { border-color: var(--accent); }
+  textarea:disabled { opacity: 0.5; }
+
+  .btn {
+    width: 100%;
+    margin-top: 16px;
+    padding: 14px;
+    border: none;
+    border-radius: 14px;
+    font-size: 16px;
+    font-weight: 600;
+    cursor: pointer;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    color: #fff;
+    transition: transform 0.15s, opacity 0.15s;
+  }
+
+  .btn:active { transform: scale(0.97); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+
+  .result {
+    display: none;
+    text-align: center;
+    margin-top: 10px;
+  }
+
+  .result.show { display: block; }
+
+  .result .big { font-size: 40px; font-weight: 800; color: var(--accent-2); }
+  .result .small { color: var(--tg-hint); font-size: 13px; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div class="card">
+  <h1>⌨️ Tez Yozish</h1>
+  <div class="subtitle">Matnni imkon qadar tez va xatosiz yozing</div>
+
+  <div class="stats">
+    <div class="stat-box">
+      <div class="label">Vaqt</div>
+      <div class="value" id="timerVal">0.0s</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">WPM</div>
+      <div class="value" id="wpmVal">0</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Xatolik</div>
+      <div class="value" id="errVal">0</div>
+    </div>
+    <div class="stat-box">
+      <div class="label">Aniqlik</div>
+      <div class="value" id="accVal">100%</div>
+    </div>
+  </div>
+
+  <div class="text-display" id="textDisplay"></div>
+
+  <textarea id="inputArea" placeholder="Yozishni shu yerdan boshlang..." autocomplete="off" autocorrect="off" spellcheck="false"></textarea>
+
+  <button class="btn" id="actionBtn">🔁 Boshqa matn</button>
+
+  <div class="result" id="resultBox">
+    <div class="big" id="finalWpm">0 WPM</div>
+    <div class="small" id="finalDetails"></div>
+  </div>
+</div>
+
+<script>
+  const tg = window.Telegram?.WebApp;
+  if (tg) {
+    tg.ready();
+    tg.expand();
+  }
+
+  // Turli mavzudagi matnlar - har safar tasodifiy tanlanadi
+  const PHRASES = [
+    "Zakovat va bilim insonni har qanday qiyinchilikdan olib chiqadi.",
+    "Har bir kod satri diqqat va mantiq bilan yoziladi.",
+    "Vaqtni tejash - eng qimmatli mahoratlardan biridir.",
+    "Telegram bot dasturlash qiziqarli va foydali soha hisoblanadi.",
+    "Tez va aniq yozish - zamonaviy dunyoda muhim ko'nikma.",
+    "Bilim - bu hech qachon eskirmaydigan boylikdir.",
+    "Har kuni bir oz o'rganish katta natijalarga olib keladi.",
+    "Musobaqada g'alaba qozonish uchun tayyorgarlik zarur.",
+    "Python dasturlash tili sodda va kuchli imkoniyatlarga ega.",
+    "Do'stlik va hamkorlik har qanday ishda muvaffaqiyat kaliti.",
+  ];
+
+  let currentText = "";
+  let startTime = null;
+  let timerInterval = null;
+  let finished = false;
+
+  const textDisplay = document.getElementById("textDisplay");
+  const inputArea = document.getElementById("inputArea");
+  const timerVal = document.getElementById("timerVal");
+  const wpmVal = document.getElementById("wpmVal");
+  const errVal = document.getElementById("errVal");
+  const accVal = document.getElementById("accVal");
+  const actionBtn = document.getElementById("actionBtn");
+  const resultBox = document.getElementById("resultBox");
+  const finalWpm = document.getElementById("finalWpm");
+  const finalDetails = document.getElementById("finalDetails");
+
+  function pickPhrase() {
+    return PHRASES[Math.floor(Math.random() * PHRASES.length)];
+  }
+
+  function renderText(typed) {
+    let html = "";
+    for (let i = 0; i < currentText.length; i++) {
+      const char = currentText[i];
+      if (i < typed.length) {
+        html += typed[i] === char
+          ? `<span class="char-correct">${escapeHtml(char)}</span>`
+          : `<span class="char-wrong">${escapeHtml(char)}</span>`;
+      } else if (i === typed.length) {
+        html += `<span class="char-current">${escapeHtml(char)}</span>`;
+      } else {
+        html += `<span class="char-pending">${escapeHtml(char)}</span>`;
+      }
+    }
+    textDisplay.innerHTML = html;
+  }
+
+  function escapeHtml(ch) {
+    if (ch === "<") return "&lt;";
+    if (ch === ">") return "&gt;";
+    if (ch === "&") return "&amp;";
+    return ch;
+  }
+
+  function countErrors(typed) {
+    let errors = 0;
+    for (let i = 0; i < typed.length; i++) {
+      if (typed[i] !== currentText[i]) errors++;
+    }
+    return errors;
+  }
+
+  // Standart WPM formulasi: 5 belgi = 1 "so'z" deb hisoblanadi.
+  // Xatolar hisobga olinadi (net WPM), aks holda ko'p xato bilan tez
+  // (lekin noto'g'ri) yozgan foydalanuvchi sun'iy ravishda yuqori
+  // ball olib qolardi.
+  function calcWpm(typed, elapsedSec) {
+    const minutes = Math.max(elapsedSec / 60, 0.001);
+    const grossWpm = (typed.length / 5) / minutes;
+    const errors = countErrors(typed);
+    const accuracy = typed.length > 0 ? Math.max(0, (typed.length - errors) / typed.length) : 1;
+    const netWpm = Math.max(0, grossWpm * accuracy);
+    return { grossWpm, netWpm, errors, accuracy: accuracy * 100 };
+  }
+
+  function resetRound() {
+    currentText = pickPhrase();
+    renderText("");
+    inputArea.value = "";
+    inputArea.disabled = false;
+    startTime = null;
+    finished = false;
+    clearInterval(timerInterval);
+    timerVal.textContent = "0.0s";
+    wpmVal.textContent = "0";
+    errVal.textContent = "0";
+    resultBox.classList.remove("show");
+    actionBtn.textContent = "🔁 Boshqa matn";
+    actionBtn.disabled = false;
+    inputArea.focus();
+  }
+
+  function startTimer() {
+    startTime = Date.now();
+    timerInterval = setInterval(() => {
+      const elapsed = (Date.now() - startTime) / 1000;
+      timerVal.textContent = elapsed.toFixed(1) + "s";
+      const { netWpm, accuracy } = calcWpm(inputArea.value, elapsed);
+      wpmVal.textContent = Math.round(netWpm);
+      accVal.textContent = Math.round(accuracy) + "%";
+    }, 100);
+  }
+
+  function finishRound(typed) {
+    finished = true;
+    clearInterval(timerInterval);
+    inputArea.disabled = true;
+
+    const elapsedSec = (Date.now() - startTime) / 1000;
+    const { netWpm, errors, accuracy } = calcWpm(typed, elapsedSec);
+    const finalWpmValue = netWpm;
+
+    timerVal.textContent = elapsedSec.toFixed(1) + "s";
+    wpmVal.textContent = Math.round(finalWpmValue);
+    errVal.textContent = errors;
+    accVal.textContent = Math.round(accuracy) + "%";
+
+    finalWpm.textContent = `${finalWpmValue.toFixed(1)} WPM`;
+    finalDetails.textContent = `Vaqt: ${elapsedSec.toFixed(1)}s | Xatolar: ${errors} | Aniqlik: ${Math.round(accuracy)}%`;
+    resultBox.classList.add("show");
+
+    actionBtn.textContent = "📤 Natijani yuborish";
+
+    // Telegram botga natijani avtomatik yuborish
+    sendResultToBot(finalWpmValue, elapsedSec, typed);
+  }
+
+  function sendResultToBot(wpm, timeSec, typedText) {
+    const payload = {
+      wpm: Number(wpm.toFixed(2)),
+      time_sec: Number(timeSec.toFixed(2)),
+      text: typedText,
+    };
+    if (tg) {
+      tg.sendData(JSON.stringify(payload));
+    } else {
+      console.log("sendData (test rejimi):", payload);
+    }
+  }
+
+  inputArea.addEventListener("input", () => {
+    if (finished) return;
+    const typed = inputArea.value;
+
+    if (startTime === null && typed.length > 0) {
+      startTimer();
+    }
+
+    renderText(typed);
+    errVal.textContent = countErrors(typed);
+
+    if (typed.length >= currentText.length) {
+      finishRound(typed);
+    }
+  });
+
+  actionBtn.addEventListener("click", () => {
+    if (finished) {
+      // Natija allaqachon yuborilgan bo'lsa, WebApp'ni yopish
+      if (tg) tg.close();
+    } else {
+      resetRound();
+    }
+  });
+
+  // Boshlang'ich holat
+  resetRound();
+</script>
+
+</body>
+</html>
