@@ -724,10 +724,6 @@ async def adm_msguser_send(message: Message, state: FSMContext):
     })
 )
 async def receive_answer(message: Message):
-    # Adminlarning o'zaro suhbati/buyruqlari tasodifan "javob" sifatida
-    # yozilib qolmasligi uchun adminlarni bu handlerdan chetlab o'tamiz.
-    if is_admin(message.from_user.id):
-        return
     if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
         return
 
