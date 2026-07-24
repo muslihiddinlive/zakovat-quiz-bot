@@ -229,6 +229,27 @@ async def process_fullname(message: Message, state: FSMContext):
         "Endi turnir raundlari bo'yicha javob yuborishingiz mumkin.",
         reply_markup=await main_menu_kb(),
     )
+    await notify_admins_new_registration(message.from_user, full_name)
+
+
+async def notify_admins_new_registration(user, full_name: str) -> None:
+    """Yangi ro'yxatdan o'tgan foydalanuvchi haqida adminlarga xabar beradi."""
+    safe_full_name = html.escape(full_name)
+    safe_username = html.escape(user.username) if user.username else "yoq"
+    text = (
+        f"🆕 <b>Yangi ro'yxatdan o'tish!</b>\n"
+        f"👤 Ism-Familiya: {safe_full_name}\n"
+        f"🔗 Username: @{safe_username}\n"
+        f"🆔 Telegram ID: <code>{user.id}</code>"
+    )
+    targets = [config.ADMIN_GROUP_ID]
+    if config.PERSONAL_CHAT_ID:
+        targets.append(config.PERSONAL_CHAT_ID)
+    for chat_id in targets:
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e:
+            logger.error(f"Ro'yxatdan o'tish xabarini {chat_id}'ga yuborishda xatolik: {e}")
 
 
 # ==================================================================
