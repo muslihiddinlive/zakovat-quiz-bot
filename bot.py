@@ -379,7 +379,7 @@ async def forward_answer_to_admins(
     message: Message, round_num: int, content_type: str,
     text_content: str | None, file_id: str | None,
 ):
-    """Kelgan javobni belgilangan formatda Admin guruh/kanalga yuboradi."""
+    """Kelgan javobni ADMIN_GROUP_ID'ga va (agar sozlangan bo'lsa) PERSONAL_CHAT_ID'ga yuboradi."""
     user = message.from_user
     safe_full_name = html.escape(user.full_name or "")
     safe_username = html.escape(user.username) if user.username else "yoq"
@@ -390,24 +390,34 @@ async def forward_answer_to_admins(
         f"👤 Qatnashchi: {safe_full_name} (@{safe_username}, ID: {user.id})\n"
     )
 
-    try:
-        if content_type in ("photo", "photo_text"):
-            caption += f"📝 Javob: {safe_text or '(faqat rasm)'}"
-            await bot.send_photo(config.ADMIN_GROUP_ID, photo=file_id, caption=caption)
-        elif content_type == "sticker":
-            await bot.send_message(config.ADMIN_GROUP_ID, caption + "📝 Javob: (stiker quyida)")
-            await bot.send_sticker(config.ADMIN_GROUP_ID, sticker=file_id)
-        elif content_type == "voice":
-            caption += "📝 Javob: (ovozli xabar quyida)"
-            await bot.send_voice(config.ADMIN_GROUP_ID, voice=file_id, caption=caption)
-        elif content_type == "audio":
-            caption += "📝 Javob: (audio quyida)"
-            await bot.send_audio(config.ADMIN_GROUP_ID, audio=file_id, caption=caption)
-        else:  # text
-            caption += f"📝 Javob: {safe_text}"
-            await bot.send_message(config.ADMIN_GROUP_ID, caption)
-    except Exception as e:
-        logger.error(f"Admin guruhga yuborishda xatolik: {e}")
+    targets = [config.ADMIN_GROUP_ID]
+    if config.PERSONAL_CHAT_ID:
+        targets.append(config.PERSONAL_CHAT_ID)
+
+    for chat_id in targets:
+        try:
+            if content_type in ("photo", "photo_text"):
+                await bot.send_photo(
+                    chat_id, photo=file_id,
+                    caption=caption + f"📝 Javob: {safe_text or '(faqat rasm)'}",
+                )
+            elif content_type == "sticker":
+                await bot.send_message(chat_id, caption + "📝 Javob: (stiker quyida)")
+                await bot.send_sticker(chat_id, sticker=file_id)
+            elif content_type == "voice":
+                await bot.send_voice(
+                    chat_id, voice=file_id, caption=caption + "📝 Javob: (ovozli xabar quyida)"
+                )
+            elif content_type == "audio":
+                await bot.send_audio(
+                    chat_id, audio=file_id, caption=caption + "📝 Javob: (audio quyida)"
+                )
+            else:  # text
+                await bot.send_message(chat_id, caption + f"📝 Javob: {safe_text}")
+        except Exception as e:
+            # Bitta manzilga yuborish muvaffaqiyatsiz bo'lsa ham,
+            # qolgan manzillarga yuborishda davom etamiz.
+            logger.error(f"Javobni {chat_id}'ga yuborishda xatolik: {e}")
 
 
 # ==================================================================
@@ -447,15 +457,19 @@ async def handle_webapp_data(message: Message):
     user = message.from_user
     safe_full_name = html.escape(user.full_name or "")
     safe_username = html.escape(user.username) if user.username else "yoq"
-    try:
-        await bot.send_message(
-            config.ADMIN_GROUP_ID,
-            f"#Raund_4\n"
-            f"👤 Qatnashchi: {safe_full_name} (@{safe_username}, ID: {user.id})\n"
-            f"⌨️ WPM: {wpm:.1f} | Vaqt: {time_sec:.1f}s",
-        )
-    except Exception as e:
-        logger.error(f"Admin guruhga yuborishda xatolik: {e}")
+    result_text = (
+        f"#Raund_4\n"
+        f"👤 Qatnashchi: {safe_full_name} (@{safe_username}, ID: {user.id})\n"
+        f"⌨️ WPM: {wpm:.1f} | Vaqt: {time_sec:.1f}s"
+    )
+    targets = [config.ADMIN_GROUP_ID]
+    if config.PERSONAL_CHAT_ID:
+        targets.append(config.PERSONAL_CHAT_ID)
+    for chat_id in targets:
+        try:
+            await bot.send_message(chat_id, result_text)
+        except Exception as e:
+            logger.error(f"4-raund natijasini {chat_id}'ga yuborishda xatolik: {e}")
 
 
 # ==================================================================

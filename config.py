@@ -15,6 +15,13 @@ CHANNEL_ID = "@ParadoksHub"            # get_chat_member() uchun (agar kanal ID 
 # Qatnashchilarning javoblari, natijalari shu guruh/kanalga (yoki topic'ga) tushadi
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "-1000000000000"))
 
+# (Ixtiyoriy) Shaxsiy chat ID - agar berilsa, barcha javoblar ADMIN_GROUP_ID'dan
+# tashqari shu shaxsiy chat'ga (DM) ham qo'shimcha yuboriladi.
+# Bot bilan avval shaxsiy suhbatni /start bilan boshlab qo'yish kerak,
+# aks holda Telegram DM yuborishga ruxsat bermaydi.
+_personal_chat_id_env = os.getenv("PERSONAL_CHAT_ID", "")
+PERSONAL_CHAT_ID = int(_personal_chat_id_env) if _personal_chat_id_env.strip() else None
+
 # Admin panelidan foydalana oladigan Telegram ID'lar ro'yxati.
 # Deploy qilishda ADMIN_IDS environment variable orqali (vergul bilan
 # ajratilgan holda, masalan "111111,222222") berish tavsiya etiladi,
