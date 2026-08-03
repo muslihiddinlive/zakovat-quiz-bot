@@ -1026,7 +1026,18 @@ async def adm_assoc_done(call: CallbackQuery, state: FSMContext):
     # (test rejimida post_text_to_channel avtomatik admin(lar)ga yo'naladi)
     await post_text_to_channel(f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n{info['hint']}")
     if await db.is_test_mode():
-        await send_test_mode_notice(f"🧪 <b>[TEST] {len(images)} ta rasm kanalga ketishi kerak edi.</b>")
+        # Rasmlar HAM to'g'ridan-to'g'ri senga (admin) yuboriladi - aks holda
+        # ularni hech qayerda ko'rmaysan va AI'ni sinab bo'lmaydi. Raqami
+        # kanaldagi bilan bir xil, shuning uchun "<raqam>: so'z1, so'z2"
+        # formatida javob yuborib, AI (Groq) baholovini xuddi jonli rejimdagidek
+        # test qilishing mumkin.
+        for target_id in await _test_mode_targets():
+            for i, file_id in enumerate(images, start=1):
+                try:
+                    await bot.send_photo(target_id, photo=file_id, caption=f"🧪 [TEST] {i}-rasm")
+                except Exception as e:
+                    logger.error(f"Test rejimida rasmni {target_id}'ga yuborishda xatolik: {e}")
+                await asyncio.sleep(0.05)
     else:
         for i, file_id in enumerate(images, start=1):
             try:
