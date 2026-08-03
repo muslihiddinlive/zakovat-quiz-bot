@@ -15,6 +15,12 @@ CHANNEL_ID = "@ParadoksHub"            # get_chat_member() uchun (agar kanal ID 
 # Qatnashchilarning javoblari, natijalari shu guruh/kanalga (yoki topic'ga) tushadi
 ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "-1000000000000"))
 
+# Dart/Futbol/Basketbol/Bowling Challenge roundlari o'tkaziladigan chat
+# ("kanalning direkti" - kanalga bog'langan muhokama/discussion guruhi).
+# Alohida berilmasa, ADMIN_GROUP_ID bilan bir xil chat ishlatiladi.
+_game_chat_env = os.getenv("GAME_CHAT_ID", "")
+GAME_CHAT_ID = int(_game_chat_env) if _game_chat_env.strip() else ADMIN_GROUP_ID
+
 # (Ixtiyoriy) Shaxsiy chat ID - agar berilsa, barcha javoblar ADMIN_GROUP_ID'dan
 # tashqari shu shaxsiy chat'ga (DM) ham qo'shimcha yuboriladi.
 # Bot bilan avval shaxsiy suhbatni /start bilan boshlab qo'yish kerak,
@@ -44,26 +50,130 @@ else:
         5302627260,  # <-- shu yerga o'z ID'ingizni va boshqa adminlarni qo'shing
     ]
 
-# "Tez yozish" Web App joylashgan manzil (Render/GitHub Pages/Netlify'ga statik host qilinadi)
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://sizning-domeningiz.com/web_app/index.html")
+# ------------------------------------------------------------
+# GROQ AI (Rasmga oidlik raundini avtomatik baholash uchun)
+# Bir nechta kalit kiritish mumkin (vergul bilan ajratib) - biri limitga
+# tushib qolsa, bot avtomatik keyingisiga o'tadi.
+# Masalan Render env: GROQ_API_KEYS = gsk_xxx,gsk_yyy,gsk_zzz
+# ------------------------------------------------------------
+_groq_keys_env = os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", ""))
+GROQ_API_KEYS = [k.strip() for k in _groq_keys_env.split(",") if k.strip()]
+GROQ_MODEL = "qwen/qwen3.6-27b"  # Groq'dagi joriy vision (rasm+matn) modeli
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
-# Turnirdagi barcha raundlar (kanaldagi e'lon tartibida).
+# ------------------------------------------------------------
+# TURNIRLAR
+# ------------------------------------------------------------
+# Har bir turnir o'z raundlar to'plamiga ega. Raund raqamlari faqat
+# O'Z TURNIRI ichida ma'noga ega (masalan Turnir 100'dagi 3-raund bilan
+# Turnir 300'dagi 3-raund - ikki xil narsa). Shu sabab ma'lumotlar
+# bazasida har bir javob tournament_id bilan birga saqlanadi.
 #
 # "kind" maydoni botning har raundga qanday munosabatda bo'lishini belgilaydi:
 #   "photo"     - oddiy javob oqimi (rasm/matn/stiker/ovoz - botda javob yig'iladi)
-#   "webapp"    - "Tez yozish" Web App orqali ishlaydi
 #   "sticker"   - Sticker Battle: raund boshlanganda admin stiker+tarif yuboradi,
 #                 bot uni kanalga e'lon qiladi; foydalanuvchilar botga stiker yuboradi
-#   "external"  - bot bu raundni UMUMAN boshqarmaydi (boshqa bot yoki guruh
-#                 muhokamasida o'tkaziladi, admin ballarni qo'lda kiritadi/hisoblaydi).
-#                 Bot faqat kanalga/foydalanuvchilarga e'lon qiladi, javob yig'maydi.
-ROUNDS = {
-    1: {"name": "🖼 Rasmni ta'riflash",   "hint": "Rasm yoki Rasm + Ta'rif (matn) yuboring", "kind": "photo"},
-    2: {"name": "🎨 Mavzuga rasm",         "hint": "Faqat Rasm/Fayl yuboring", "kind": "photo"},
-    3: {"name": "🏆 Rasm Battle",          "hint": "Faqat Rasm yuboring", "kind": "photo"},
-    4: {"name": "🧮 Matematika Rush",      "hint": "Bu raund kanal muhokamasida BOSHQA BOT orqali o'tkaziladi. Botda javob yuborish shart emas.", "kind": "external"},
-    5: {"name": "⌨️ Tez yozish (Web App)", "hint": "Bosh menyudagi 'Tez yozish' tugmasidan foydalaning", "kind": "webapp"},
-    6: {"name": "😂 Sticker Battle",       "hint": "Stiker yuboring", "kind": "sticker"},
-    7: {"name": "⚽ Futbol Sticker Quiz",  "hint": "Bu raund GURUHDA o'tkaziladi, admin ballarni qo'lda hisoblaydi. Botda javob yuborish shart emas.", "kind": "external"},
-    8: {"name": "🎵 Musiqani top",         "hint": "Musiqa/audio faylini yuboring", "kind": "photo"},
+#   "assoc"     - Rasmga oidlik: admin bir nechta rasm yuboradi va "Tayyor" bosadi,
+#                 bot ularni RAQAMLAB kanalga e'lon qiladi; userlar botga
+#                 "<raqam>: so'z1, so'z2, ..." formatida javob yuboradi, AI (Groq)
+#                 rasm bilan solishtirib har bir so'zni to'g'ri/noto'g'ri deb
+#                 baholaydi (foydalanuvchiga ko'rsatilmaydi - faqat adminga)
+#   "external"  - bot bu raundni UMUMAN boshqarmaydi (boshqa bot, guruh
+#                 muhokamasi yoki kanalning direkt/muhokama guruhida o'tkaziladi,
+#                 admin ballarni qo'lda kiritadi/hisoblaydi). Bot faqat
+#                 kanalga/foydalanuvchilarga e'lon qiladi, javob yig'maydi.
+# ------------------------------------------------------------
+
+TOURNAMENTS: dict[int, dict] = {
+    # ------------------------------------------------------------------
+    # TURNIR 100 - avvalgi musobaqa, shartlari o'zgarishsiz qoladi.
+    # (Eski "Tez yozish - Web App" raundi butunlay olib tashlandi, shu
+    # sabab 5-raqam ataylab bo'sh qoldirilgan - eski javoblar tarixidagi
+    # raqamlar buzilib qolmasligi uchun qolgan raundlar qayta raqamlanmadi.)
+    # ------------------------------------------------------------------
+    100: {
+        "name": "Turnir 100",
+        "rounds": {
+            1: {"name": "🖼 Rasmni ta'riflash", "hint": "Rasm yoki Rasm + Ta'rif (matn) yuboring", "kind": "photo"},
+            2: {"name": "🎨 Mavzuga rasm", "hint": "Faqat Rasm/Fayl yuboring", "kind": "photo"},
+            3: {"name": "🏆 Rasm Battle", "hint": "Faqat Rasm yuboring", "kind": "photo"},
+            4: {"name": "🧮 Matematika Rush", "hint": "Bu raund kanal muhokamasida BOSHQA BOT orqali o'tkaziladi. Botda javob yuborish shart emas.", "kind": "external"},
+            6: {"name": "😂 Sticker Battle", "hint": "Stiker yuboring", "kind": "sticker"},
+            7: {"name": "⚽ Futbol Sticker Quiz", "hint": "Bu raund GURUHDA o'tkaziladi, admin ballarni qo'lda hisoblaydi. Botda javob yuborish shart emas.", "kind": "external"},
+            8: {"name": "🎵 Musiqani top", "hint": "Musiqa/audio faylini yuboring", "kind": "photo"},
+        },
+    },
+    # ------------------------------------------------------------------
+    # TURNIR 300 - yangi musobaqa, kengaytirilgan raundlar bilan.
+    # ------------------------------------------------------------------
+    300: {
+        "name": "Turnir 300",
+        "rounds": {
+            1: {
+                "name": "🏛 Zakovat Battle",
+                "hint": (
+                    "3-5 kishilik jamoalarda maslahatlashib, savollarga to'g'ri javob toping. "
+                    "Hamjihatlik va tezkor fikrlash sizni g'alabaga olib boradi!\n"
+                    "Bu raundni bot boshqarmaydi - admin uni alohida tashkil qiladi, "
+                    "bot faqat boshlanganini e'lon qiladi."
+                ),
+                "kind": "external",
+            },
+            2: {
+                "name": "🖼 Rasmga oidlik",
+                "hint": (
+                    "Bot rasm yuboradi. Siz esa ushbu rasmga oid imkon qadar ko'proq bog'liq "
+                    "so'z, shaxs, kompaniya, brend, mahsulot, joy, voqea yoki tushunchalarni "
+                    "topishingiz kerak. Eng ko'p va eng to'g'ri assotsiatsiyalarni topgan "
+                    "ishtirokchi g'olib bo'ladi!\n"
+                    "Misol: Instagram logosi → Instagram, Meta, Mark Zuckerberg, Facebook, "
+                    "Reels, Stories, Threads, hashtag, DM va hokazo.\n\n"
+                    "Javobingizni: <b>\"&lt;rasm raqami&gt;: so'z1, so'z2, ...\"</b> shaklida yuboring "
+                    "(masalan: <code>3: Instagram, Meta, Zuckerberg</code>). "
+                    "Keyingi raund boshlanmaguncha istagancha marta javob yuborishingiz mumkin."
+                ),
+                "kind": "assoc",
+            },
+            3: {"name": "🎨 Mavzuga rasm", "hint": "Berilgan mavzu asosida rasm chizing.", "kind": "photo"},
+            4: {"name": "🏆 Rasm Battle", "hint": "Eng kreativ va chiroyli rasmni chizing!", "kind": "photo"},
+            5: {
+                "name": "🌍 Bayroq Challenge",
+                "hint": (
+                    "Bayroq, xarita, poytaxt yoki mashhur ramzlarga qarab davlatni toping! "
+                    "Bu raund boshqa yo'l bilan (kanal/guruh muhokamasida) o'tkaziladi."
+                ),
+                "kind": "external",
+            },
+            6: {
+                "name": "🧮 Matematika Rush",
+                "hint": "Guruh bo'lib tezkor matematik misollarni yeching. Bu raund kanal muhokamasida boshqa bot orqali o'tkaziladi.",
+                "kind": "external",
+            },
+            7: {
+                "name": "🎯 Dart Challenge",
+                "hint": "Telegramning 🎯 dart o'yinida eng yaxshi natijani qayd eting. Bu raund muhokama guruhida o'tkaziladi.",
+                "kind": "external",
+                "extra_target": "game_chat",
+            },
+            8: {
+                "name": "⚽ Futbol Challenge",
+                "hint": "Telegramning ⚽ futbol o'yinida eng yaxshi natijani qo'lga kiriting. Bu raund muhokama guruhida o'tkaziladi.",
+                "kind": "external",
+                "extra_target": "game_chat",
+            },
+            9: {
+                "name": "🏀 Basketbol Challenge",
+                "hint": "🏀 To'pni savatga tushiring va eng yuqori natijani qayd eting. Bu raund muhokama guruhida o'tkaziladi.",
+                "kind": "external",
+                "extra_target": "game_chat",
+            },
+            10: {
+                "name": "🎳 Bowling Challenge",
+                "hint": "🎳 Strike qiling va eng yaxshi natija uchun bellashing. Bu raund muhokama guruhida o'tkaziladi.",
+                "kind": "external",
+                "extra_target": "game_chat",
+            },
+            11: {"name": "🎵 Musiqani top", "hint": "Berilgan mavzu yoki qisqa parchaga qarab qo'shiqni toping.", "kind": "photo"},
+        },
+    },
 }

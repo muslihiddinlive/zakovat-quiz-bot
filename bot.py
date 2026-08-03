@@ -1,9 +1,14 @@
 # bot.py
 # ------------------------------------------------------------
-# "Zakovat Quiz" turniri uchun asosiy Telegram bot kodi (Aiogram 3.x)
+# "Zakovat Quiz" turnirlari uchun asosiy Telegram bot kodi (Aiogram 3.x)
+#
+# Bitta bot ichida bir nechta TURNIR bo'lishi mumkin (config.TOURNAMENTS):
+#   - Turnir 100 - avvalgi musobaqa, shartlari o'zgarishsiz
+#   - Turnir 300 - yangi, kengaytirilgan musobaqa ("Rasmga oidlik" AI orqali
+#     baholanadigan raund bilan)
 #
 # Ishga tushirish:
-#   pip install aiogram aiosqlite openpyxl
+#   pip install -r requirements.txt
 #   python bot.py
 # ------------------------------------------------------------
 import asyncio
@@ -12,9 +17,11 @@ import io
 import json
 import logging
 import os
+import re
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, BaseMiddleware
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode, ChatMemberStatus, ContentType
@@ -29,7 +36,6 @@ from aiogram.types import (
     InlineKeyboardButton,
     ReplyKeyboardMarkup,
     KeyboardButton,
-    WebAppInfo,
     BufferedInputFile,
     FSInputFile,
     TelegramObject,
@@ -38,18 +44,17 @@ from aiogram.types import (
 import config
 import database as db
 
+
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# Raund raqamlarini "kind" bo'yicha oldindan aniqlab olamiz - shunda kodda
-# hech qayerda "4-raund" kabi qattiq yozilgan raqamlar ishlatilmaydi,
-# raundlar tartibi o'zgarsa ham hammasi to'g'ri ishlayveradi.
-WEBAPP_ROUND = next((n for n, i in config.ROUNDS.items() if i.get("kind") == "webapp"), None)
-STICKER_ROUND = next((n for n, i in config.ROUNDS.items() if i.get("kind") == "sticker"), None)
-EXTERNAL_ROUNDS = {n for n, i in config.ROUNDS.items() if i.get("kind") == "external"}
+
+def get_rounds(tournament_id: int) -> dict:
+    """Berilgan turnirning raundlar lug'atini qaytaradi (topilmasa - bo'sh)."""
+    return config.TOURNAMENTS.get(tournament_id, {}).get("rounds", {})
 
 
 # ==================================================================
@@ -65,6 +70,12 @@ class AdminStickerAnnounceStates(StatesGroup):
     waiting_caption = State()
 
 
+class AdminAssocStates(StatesGroup):
+    """'Rasmga oidlik' raundi uchun: admin bir nechta rasm yuboradi,
+    so'ng ✅ Tayyor bosadi - shundan keyin rasmlar RAQAMLAB kanalga ketadi."""
+    collecting_images = State()
+
+
 class AdminMessageUserStates(StatesGroup):
     waiting_message = State()
 
@@ -78,8 +89,6 @@ async def main_menu_kb() -> ReplyKeyboardMarkup:
 
     - Turnir hali boshlanmagan bo'lsa: faqat "Qoidalar" va "Natijalarim" ko'rinadi.
     - Turnir boshlangan bo'lsa: "Javob yuborish" qo'shiladi.
-    - Faol raund Web App raundi bo'lsagina "Tez yozish" tugmasi chiqadi -
-      ya'ni admin shu raundni boshlamaguncha, WebApp tugmasi umuman ko'rinmaydi.
     """
     tournament_active = await db.is_tournament_active()
     active_round = await db.get_active_round()
@@ -87,10 +96,6 @@ async def main_menu_kb() -> ReplyKeyboardMarkup:
     rows = []
     if tournament_active and active_round:
         rows.append([KeyboardButton(text="📤 Javob yuborish")])
-        if active_round == WEBAPP_ROUND:
-            rows.append(
-                [KeyboardButton(text="⌨️ Tez yozish (Web App)", web_app=WebAppInfo(url=config.WEBAPP_URL))]
-            )
     rows.append([KeyboardButton(text="ℹ️ Qoidalar"), KeyboardButton(text="📊 Mening natijalarim")])
 
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
@@ -107,16 +112,17 @@ def subscribe_kb() -> InlineKeyboardMarkup:
     )
 
 
-def admin_panel_kb(tournament_active: bool, active_round: int) -> InlineKeyboardMarkup:
+def admin_panel_kb(tournament_active: bool, active_tournament: int, active_round: int) -> InlineKeyboardMarkup:
     rows = []
     if tournament_active:
         rows.append([InlineKeyboardButton(text="⏹ Turnirni to'xtatish", callback_data="adm_stop")])
     else:
         rows.append([InlineKeyboardButton(text="▶️ Turnirni boshlash", callback_data="adm_start")])
 
-    round_label = config.ROUNDS.get(active_round, {}).get("name") if active_round else None
+    rounds = get_rounds(active_tournament)
+    round_label = rounds.get(active_round, {}).get("name") if active_round else None
     rows.append([InlineKeyboardButton(
-        text=f"🔀 Raund boshlash" + (f" (hozir: {round_label})" if round_label else ""),
+        text="🔀 Raund boshlash" + (f" (hozir: {round_label})" if round_label else ""),
         callback_data="adm_pick_round",
     )])
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
@@ -127,11 +133,22 @@ def admin_panel_kb(tournament_active: bool, active_round: int) -> InlineKeyboard
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def admin_round_picker_kb() -> InlineKeyboardMarkup:
-    """Admin qaysi raundni faol qilishni tanlashi uchun."""
+def admin_tournament_picker_kb() -> InlineKeyboardMarkup:
+    """Admin qaysi TURNIRni boshlashni tanlashi uchun (Turnir 100 / Turnir 300)."""
+    rows = [
+        [InlineKeyboardButton(text=info["name"], callback_data=f"adm_choose_t_{tid}")]
+        for tid, info in config.TOURNAMENTS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_round_picker_kb(tournament_id: int) -> InlineKeyboardMarkup:
+    """Admin tanlangan turnirda qaysi raundni faol qilishni tanlashi uchun."""
+    rounds = get_rounds(tournament_id)
     rows = [
         [InlineKeyboardButton(text=info["name"], callback_data=f"adm_setround_{num}")]
-        for num, info in config.ROUNDS.items()
+        for num, info in sorted(rounds.items())
     ]
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -297,17 +314,27 @@ async def notify_admins_new_registration(user, full_name: str) -> None:
 
 @dp.message(F.text == "ℹ️ Qoidalar")
 async def show_rules(message: Message):
-    rounds_text = "\n".join(f"{num}. {info['name']}" for num, info in config.ROUNDS.items())
-    webapp_info = config.ROUNDS.get(WEBAPP_ROUND, {}).get("name", "")
-    external_names = ", ".join(config.ROUNDS[n]["name"] for n in sorted(EXTERNAL_ROUNDS))
-    await message.answer(
-        "📜 <b>Zakovat Quiz - Qoidalar</b>\n\n"
-        f"Turnir {len(config.ROUNDS)} ta raunddan iborat:\n{rounds_text}\n\n"
+    active_tournament = await db.get_active_tournament()
+    rounds = get_rounds(active_tournament)
+    if not rounds:
+        await message.answer(
+            "📜 <b>Zakovat Quiz</b>\n\nHozircha faol turnir yo'q. Admin turnir boshlashini kuting."
+        )
+        return
+
+    t_name = config.TOURNAMENTS[active_tournament]["name"]
+    rounds_text = "\n".join(f"{num}. {info['name']}" for num, info in sorted(rounds.items()))
+    external_names = ", ".join(info["name"] for info in rounds.values() if info.get("kind") == "external")
+
+    text = (
+        f"📜 <b>{t_name} - Qoidalar</b>\n\n"
+        f"Turnir {len(rounds)} ta raunddan iborat:\n{rounds_text}\n\n"
         "Har bir raund uchun topshiriq kanal/guruhga e'lon qilinadi. "
-        "Javobingizni esa aynan shu botga \"📤 Javob yuborish\" tugmasi orqali yuboring.\n\n"
-        f"⌨️ <b>{webapp_info}</b> uchun Web App orqali o'yin ochiladi va natija avtomatik yuboriladi.\n"
-        f"⚠️ <b>{external_names}</b> - bular botda emas, kanal/guruh muhokamasida o'tkaziladi."
+        "Javobingizni esa aynan shu botga \"📤 Javob yuborish\" tugmasi orqali yuboring.\n"
     )
+    if external_names:
+        text += f"\n⚠️ <b>{external_names}</b> - bular botda emas, kanal/guruh muhokamasida o'tkaziladi."
+    await message.answer(text)
 
 
 @dp.message(F.text == "📊 Mening natijalarim")
@@ -319,10 +346,14 @@ async def my_results(message: Message):
 
     lines = ["📊 <b>Sizning yuborgan javoblaringiz:</b>\n"]
     for a in answers:
-        round_name = config.ROUNDS.get(a["round_num"], {}).get("name", f"{a['round_num']}-raund")
+        tournament_id = a["tournament_id"] or 100
+        rounds = get_rounds(tournament_id)
+        round_name = rounds.get(a["round_num"], {}).get("name", f"{a['round_num']}-raund")
         extra = ""
         if a["wpm"] is not None:
             extra = f" | WPM: {a['wpm']:.1f}, vaqt: {a['time_sec']:.1f}s"
+        if a["ref_num"] is not None:
+            extra += f" | rasm #{a['ref_num']}"
         lines.append(f"• {round_name} — {a['content_type']}{extra} ({a['submitted_at']})")
     await message.answer("\n".join(lines))
 
@@ -332,6 +363,7 @@ async def my_results(message: Message):
 # ==================================================================
 
 RESERVED_MENU_TEXTS = {"📤 Javob yuborish", "ℹ️ Qoidalar", "📊 Mening natijalarim"}
+ASSOC_ANSWER_RE = re.compile(r"^\s*(\d+)\s*[\).:\-]?\s*(.+)$", re.S)
 
 
 @dp.message(F.text == "📤 Javob yuborish")
@@ -348,29 +380,27 @@ async def show_answer_prompt(message: Message):
         await message.answer("⏸ Hozircha turnir faol emas. Admin turnirni boshlashini kuting.")
         return
 
+    tournament_id = await db.get_active_tournament()
+    rounds = get_rounds(tournament_id)
     round_num = await db.get_active_round()
-    if not round_num:
+    if not round_num or round_num not in rounds:
         await message.answer("Hozircha faol raund yo'q. Admin raund boshlashini kuting.")
         return
 
-    if round_num in EXTERNAL_ROUNDS:
-        await message.answer(
-            f"ℹ️ <b>{config.ROUNDS[round_num]['name']}</b>\n\n{config.ROUNDS[round_num]['hint']}"
-        )
+    info = rounds[round_num]
+
+    if info["kind"] == "external":
+        await message.answer(f"ℹ️ <b>{info['name']}</b>\n\n{info['hint']}")
         return
 
-    if round_num == WEBAPP_ROUND:
-        await message.answer(
-            "⌨️ Hozirgi faol raund - Tez yozish (Web App). "
-            "Javob yuborish uchun bosh menyudagi \"⌨️ Tez yozish\" tugmasidan foydalaning."
-        )
+    if info["kind"] == "assoc":
+        await message.answer(f"🖼 <b>{info['name']}</b>\n\n{info['hint']}")
         return
 
-    if await db.has_answered(message.from_user.id, round_num):
+    if await db.has_answered(message.from_user.id, tournament_id, round_num):
         await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
         return
 
-    info = config.ROUNDS[round_num]
     await message.answer(
         f"✏️ <b>{info['name']}</b>\n\n"
         f"{info['hint']}\n\n"
@@ -378,12 +408,12 @@ async def show_answer_prompt(message: Message):
     )
 
 
-async def notify_admins_new_answer(answer_id: int, user, round_num: int, content_type: str):
+async def notify_admins_new_answer(answer_id: int, user, round_num: int, content_type: str, tournament_id: int):
     """Javob kelganini adminlarga QISQA xabar bilan bildiradi - to'liq kontent
     guruhni to'ldirib yubormasligi uchun, faqat "Ko'rish" bosilganda ochiladi."""
     safe_full_name = html.escape(user.full_name or "")
     safe_username = html.escape(user.username) if user.username else "yoq"
-    round_name = config.ROUNDS.get(round_num, {}).get("name", f"{round_num}-raund")
+    round_name = get_rounds(tournament_id).get(round_num, {}).get("name", f"{round_num}-raund")
 
     text = (
         f"📩 <b>Yangi javob keldi!</b>\n"
@@ -430,63 +460,253 @@ async def adm_view_answer(call: CallbackQuery):
 
 
 # ==================================================================
-#  WEB APP DAN KELGAN MA'LUMOT (Tez yozish raundi - 4-raund)
+#  "RASMGA OIDLIK" RAUNDI - AI (Groq) YORDAMIDA AVTOMATIK BAHOLASH
 # ==================================================================
 
-@dp.message(F.content_type == ContentType.WEB_APP_DATA)
-async def handle_webapp_data(message: Message):
-    if not await db.is_round_enabled(WEBAPP_ROUND):
-        await message.answer("Bu raund hozir yopiq, natija qabul qilinmadi.")
-        return
+async def call_groq_vision(image_url: str, words: list[str]) -> dict | None:
+    """Groq vision modeliga rasm + so'zlar ro'yxatini yuborib, qaysi so'zlar
+    rasmga chindan ham aloqador (to'g'ri) va qaysilari emas (noto'g'ri)
+    ekanini so'raydi. Bir nechta API kalit bo'lsa, birinchisi ishlamasa
+    (limit/xatolik) navbatdagisiga o'tadi."""
+    if not config.GROQ_API_KEYS:
+        logger.warning("GROQ_API_KEYS sozlanmagan - 'Rasmga oidlik' AI baholovi o'tkazib yuboriladi.")
+        return None
 
-    if await db.has_answered(message.from_user.id, WEBAPP_ROUND):
-        await message.answer(
-            "⚠️ Siz bu raundda allaqachon ishtirok etgansiz. "
-            "Har bir ishtirokchi faqat bir marta urinib ko'ra oladi, "
-            "shuning uchun yangi natija qabul qilinmaydi."
-        )
-        return
+    system_prompt = (
+        "Sen 'Zakovat' viktorinasining 'Rasmga oidlik' raundida hakamsan. "
+        "Senga bitta rasm va ishtirokchi yozgan so'z/ibora ro'yxati beriladi. "
+        "Vazifang: har bir so'z/iborani rasmga chindan ham aloqador "
+        "(bog'liq shaxs, kompaniya, brend, mahsulot, xizmat, joy, voqea yoki "
+        "tushuncha) yoki aloqasiz ekanini aniqlash. Faqat quyidagi JSON "
+        "formatda javob ber, boshqa hech qanday matn yozma:\n"
+        '{"correct": ["so\'z1", "so\'z2"], "incorrect": ["so\'z3"]}'
+    )
+    user_text = "Ishtirokchi yuborgan so'zlar (vergul bilan ajratilgan):\n" + ", ".join(words)
 
+    body = {
+        "model": config.GROQ_MODEL,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": user_text},
+                    {"type": "image_url", "image_url": {"url": image_url}},
+                ],
+            },
+        ],
+        "temperature": 0.2,
+        "max_completion_tokens": 600,
+        "response_format": {"type": "json_object"},
+    }
+
+    for key in config.GROQ_API_KEYS:
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    config.GROQ_API_URL,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    json=body,
+                    timeout=aiohttp.ClientTimeout(total=40),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        content = data["choices"][0]["message"]["content"]
+                        parsed = json.loads(content)
+                        correct = [str(x) for x in parsed.get("correct", [])]
+                        incorrect = [str(x) for x in parsed.get("incorrect", [])]
+                        return {"correct": correct, "incorrect": incorrect}
+                    else:
+                        err_text = await resp.text()
+                        logger.warning(f"Groq kalitida xatolik ({resp.status}): {err_text[:300]}")
+        except Exception as e:
+            logger.warning(f"Groq so'rovida xatolik: {e}")
+        # shu kalit ishlamadi -> ro'yxatdagi keyingi kalitga o'tamiz
+
+    logger.error("Barcha GROQ_API_KEYS urinishlari muvaffaqiyatsiz tugadi.")
+    return None
+
+
+async def score_assoc_answer(answer_id: int, image_file_id: str, words: list[str], user, image_number: int) -> None:
+    """AI orqali baholaydi va natijani (FAQAT adminlarga - foydalanuvchiga
+    HECH QACHON emas) yuboradi."""
     try:
-        payload = json.loads(message.web_app_data.data)
-        wpm = float(payload.get("wpm", 0))
-        time_sec = float(payload.get("time_sec", 0))
-        typed_text = payload.get("text", "")
+        file_info = await bot.get_file(image_file_id)
+        image_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_info.file_path}"
     except Exception as e:
-        logger.error(f"WebApp data parse xatosi: {e}")
-        await message.answer("❌ Natijani o'qishda xatolik yuz berdi. Qaytadan urinib ko'ring.")
+        logger.error(f"Rasm faylini olishda xatolik: {e}")
         return
 
-    await db.add_answer(
-        tg_id=message.from_user.id,
-        round_num=WEBAPP_ROUND,
-        content_type="webapp_typing",
-        text_content=typed_text,
-        wpm=wpm,
-        time_sec=time_sec,
+    result = await call_groq_vision(image_url, words)
+    if result is None:
+        return
+
+    correct, incorrect = result["correct"], result["incorrect"]
+    score = len(correct) - len(incorrect)
+    await db.update_answer_ai_result(
+        answer_id, score, json.dumps(correct, ensure_ascii=False), json.dumps(incorrect, ensure_ascii=False)
     )
 
-    await message.answer(
-        f"✅ Natijangiz qabul qilindi!\n⌨️ Tezlik: <b>{wpm:.1f} WPM</b>\n⏱ Vaqt: <b>{time_sec:.1f} soniya</b>",
-        reply_markup=await main_menu_kb(),
-    )
-
-    user = message.from_user
-    safe_full_name = html.escape(user.full_name or "")
+    safe_name = html.escape(user.full_name or "")
     safe_username = html.escape(user.username) if user.username else "yoq"
-    result_text = (
-        f"#Raund_{WEBAPP_ROUND}\n"
-        f"👤 Qatnashchi: {safe_full_name} (@{safe_username}, ID: {user.id})\n"
-        f"⌨️ WPM: {wpm:.1f} | Vaqt: {time_sec:.1f}s"
+    text = (
+        f"🤖 <b>AI baholadi — Rasmga oidlik</b>\n"
+        f"🖼 Rasm: #{image_number}\n"
+        f"👤 {safe_name} (@{safe_username}, ID: {user.id})\n"
+        f"✅ To'g'ri ({len(correct)}): {html.escape(', '.join(correct)) or '—'}\n"
+        f"❌ Noto'g'ri ({len(incorrect)}): {html.escape(', '.join(incorrect)) or '—'}\n"
+        f"🧮 Ball: <b>{score:+d}</b>"
     )
     targets = [config.ADMIN_GROUP_ID]
     if config.PERSONAL_CHAT_ID:
         targets.append(config.PERSONAL_CHAT_ID)
     for chat_id in targets:
         try:
-            await bot.send_message(chat_id, result_text)
+            await bot.send_message(chat_id, text)
         except Exception as e:
-            logger.error(f"4-raund natijasini {chat_id}'ga yuborishda xatolik: {e}")
+            logger.error(f"AI natijasini {chat_id}'ga yuborishda xatolik: {e}")
+
+
+async def handle_assoc_answer(message: Message, tournament_id: int, round_num: int) -> None:
+    """'Rasmga oidlik' raundi uchun javobni qabul qiladi. Format:
+    '<rasm raqami>: so'z1, so'z2, ...'. Foydalanuvchi keyingi round
+    boshlanmaguncha istagancha marta javob yubora oladi (has_answered
+    tekshiruvi YO'Q - bu ataylab shunday)."""
+    if not message.text:
+        await message.answer(
+            "🖼 Bu raundda javobni FAQAT matn ko'rinishida yuboring:\n"
+            "\"&lt;rasm raqami&gt;: so'z1, so'z2, ...\"\n"
+            "Masalan: <code>3: Instagram, Meta, Zuckerberg</code>"
+        )
+        return
+
+    m = ASSOC_ANSWER_RE.match(message.text)
+    if not m:
+        await message.answer(
+            "❗️ Format noto'g'ri. Avval rasm raqamini, keyin so'zlarni yuboring.\n"
+            "Masalan: <code>3: Instagram, Meta, Zuckerberg</code>"
+        )
+        return
+
+    image_number = int(m.group(1))
+    words_part = m.group(2).strip()
+    words = [w.strip() for w in re.split(r"[,\n]+", words_part) if w.strip()]
+    if not words:
+        await message.answer("❗️ Iltimos, rasm raqamidan keyin kamida bitta so'z/ibora yozing.")
+        return
+
+    image = await db.get_assoc_image(tournament_id, round_num, image_number)
+    if image is None:
+        await message.answer(
+            f"❗️ #{image_number} raqamli rasm topilmadi. Kanaldagi rasm raqamlaridan birini yozing."
+        )
+        return
+
+    answer_id = await db.add_answer(
+        tg_id=message.from_user.id,
+        round_num=round_num,
+        tournament_id=tournament_id,
+        content_type="assoc",
+        text_content=words_part,
+        ref_num=image_number,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+    await message.answer("✅ Javobingiz qabul qilindi va hakamlarga yuborildi!")
+
+    asyncio.create_task(
+        score_assoc_answer(
+            answer_id=answer_id,
+            image_file_id=image["file_id"],
+            words=words,
+            user=message.from_user,
+            image_number=image_number,
+        )
+    )
+
+
+@dp.message(
+    F.content_type.in_({
+        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
+        ContentType.VOICE, ContentType.AUDIO,
+    })
+)
+async def receive_answer(message: Message):
+    if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
+        return
+
+    if not await db.is_registered(message.from_user.id):
+        return  # ro'yxatdan o'tmagan - sukut (spam bo'lmasin)
+    if not await db.is_tournament_active():
+        return
+
+    tournament_id = await db.get_active_tournament()
+    rounds = get_rounds(tournament_id)
+    round_num = await db.get_active_round()
+    if not round_num or round_num not in rounds:
+        return
+
+    info = rounds[round_num]
+
+    if info["kind"] == "external":
+        return  # bot bu raundni umuman boshqarmaydi, javob yig'maydi
+
+    if info["kind"] == "assoc":
+        await handle_assoc_answer(message, tournament_id, round_num)
+        return
+
+    # Qolgan turlar ("photo", "sticker") - odatiy javob yig'ish oqimi
+    if await db.has_answered(message.from_user.id, tournament_id, round_num):
+        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
+        return
+
+    content_type = None
+    text_content = None
+    file_id = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        if message.caption:
+            content_type = "photo_text"
+            text_content = message.caption
+        else:
+            content_type = "photo"
+    elif message.sticker:
+        content_type = "sticker"
+        file_id = message.sticker.file_id
+    elif message.voice:
+        content_type = "voice"
+        file_id = message.voice.file_id
+    elif message.audio:
+        content_type = "audio"
+        file_id = message.audio.file_id
+    elif message.text:
+        content_type = "text"
+        text_content = message.text
+    else:
+        return
+
+    answer_id = await db.add_answer(
+        tg_id=message.from_user.id,
+        round_num=round_num,
+        tournament_id=tournament_id,
+        content_type=content_type,
+        text_content=text_content,
+        file_id=file_id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+    await message.answer(
+        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
+        reply_markup=await main_menu_kb(),
+    )
+
+    await notify_admins_new_answer(
+        answer_id=answer_id, user=message.from_user, round_num=round_num,
+        content_type=content_type, tournament_id=tournament_id,
+    )
 
 
 # ==================================================================
@@ -499,10 +719,17 @@ def is_admin(user_id: int) -> bool:
 
 async def admin_panel_text() -> str:
     tournament_active = await db.is_tournament_active()
+    active_tournament = await db.get_active_tournament()
     active_round = await db.get_active_round()
     status = "🟢 Faol" if tournament_active else "🔴 Faol emas"
-    round_text = config.ROUNDS.get(active_round, {}).get("name", "yo'q") if active_round else "yo'q"
-    return f"🛠 <b>Admin panel</b>\nTurnir holati: {status}\nHozirgi faol raund: {round_text}"
+    t_name = config.TOURNAMENTS.get(active_tournament, {}).get("name", "tanlanmagan") if active_tournament else "tanlanmagan"
+    round_text = get_rounds(active_tournament).get(active_round, {}).get("name", "yo'q") if active_round else "yo'q"
+    return (
+        f"🛠 <b>Admin panel</b>\n"
+        f"Turnir holati: {status}\n"
+        f"Tanlangan turnir: {t_name}\n"
+        f"Hozirgi faol raund: {round_text}"
+    )
 
 
 @dp.message(Command("admin"))
@@ -511,17 +738,38 @@ async def cmd_admin(message: Message):
         await message.answer("⛔️ Bu buyruq faqat adminlar uchun.")
         return
     tournament_active = await db.is_tournament_active()
+    active_tournament = await db.get_active_tournament()
     active_round = await db.get_active_round()
-    await message.answer(await admin_panel_text(), reply_markup=admin_panel_kb(tournament_active, active_round))
+    await message.answer(
+        await admin_panel_text(),
+        reply_markup=admin_panel_kb(tournament_active, active_tournament, active_round),
+    )
 
 
 @dp.callback_query(F.data == "adm_start")
 async def adm_start(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("⛔️", show_alert=True)
+    await call.message.edit_text(
+        "🏆 <b>Qaysi turnirni boshlamoqchisiz?</b>",
+        reply_markup=admin_tournament_picker_kb(),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_choose_t_"))
+async def adm_choose_tournament(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    tournament_id = int(call.data.split("_")[-1])
+    if tournament_id not in config.TOURNAMENTS:
+        return await call.answer("Noma'lum turnir.", show_alert=True)
+
+    await db.set_active_tournament(tournament_id)
     await db.set_tournament_active(True)
-    await call.answer("✅ Turnir boshlandi!")
-    await post_text_to_channel("🎉 <b>Zakovat Quiz turniri boshlandi!</b>\nRaundlar birma-bir e'lon qilinadi, tayyor turing!")
+    t_name = config.TOURNAMENTS[tournament_id]["name"]
+    await call.answer(f"✅ {t_name} boshlandi!")
+    await post_text_to_channel(f"🎉 <b>{t_name} boshlandi!</b>\nRaundlar birma-bir e'lon qilinadi, tayyor turing!")
     asyncio.create_task(backup_db_to_telegram())
 
     # MUHIM: turnir "boshlangani" hali hech qanday raund faol degani emas!
@@ -529,11 +777,11 @@ async def adm_start(call: CallbackQuery):
     # o'tkazib yubormasligi uchun (aks holda "📤 Javob yuborish" tugmasi
     # hech qachon chiqmaydi va foydalanuvchilar javob yubora olmaydi).
     await call.message.edit_text(
-        "✅ Turnir boshlandi!\n\n"
+        f"✅ {t_name} boshlandi!\n\n"
         "⚠️ <b>Diqqat: hozircha hech qanday raund faol emas.</b>\n"
         "Foydalanuvchilarda \"📤 Javob yuborish\" tugmasi chiqishi uchun "
         "pastdan BIRINCHI raundni tanlang 👇",
-        reply_markup=admin_round_picker_kb(),
+        reply_markup=admin_round_picker_kb(tournament_id),
     )
 
 
@@ -543,7 +791,7 @@ async def adm_stop(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     await db.set_tournament_active(False)
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0)
+        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0, 0)
     )
     await call.answer("Turnir to'xtatildi!")
     end_text = "🏁 Turnir yakunlandi! Rahmat, barchangizga!\n🏆 G'oliblar ERTAGA e'lon qilinadi!"
@@ -557,9 +805,10 @@ async def adm_back(call: CallbackQuery):
     if not is_admin(call.from_user.id):
         return await call.answer("⛔️", show_alert=True)
     tournament_active = await db.is_tournament_active()
+    active_tournament = await db.get_active_tournament()
     active_round = await db.get_active_round()
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(tournament_active, active_round)
+        await admin_panel_text(), reply_markup=admin_panel_kb(tournament_active, active_tournament, active_round)
     )
     await call.answer()
 
@@ -570,11 +819,12 @@ async def adm_pick_round(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     if not await db.is_tournament_active():
         return await call.answer("Avval turnirni boshlang!", show_alert=True)
+    active_tournament = await db.get_active_tournament()
     await call.message.edit_text(
         "🔀 <b>Qaysi raundni faol qilmoqchisiz?</b>\n\n"
         "⚠️ Yangi raund tanlanishi bilan hozirgi faol raund AVTOMATIK yopiladi "
         "va foydalanuvchilarga hamda kanalga xabar yuboriladi.",
-        reply_markup=admin_round_picker_kb(),
+        reply_markup=admin_round_picker_kb(active_tournament),
     )
     await call.answer()
 
@@ -584,12 +834,16 @@ async def adm_set_round(call: CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return await call.answer("⛔️", show_alert=True)
     round_num = int(call.data.split("_")[-1])
-    info = config.ROUNDS[round_num]
+    tournament_id = await db.get_active_tournament()
+    rounds = get_rounds(tournament_id)
+    info = rounds.get(round_num)
+    if info is None:
+        return await call.answer("Noma'lum raund.", show_alert=True)
 
-    if round_num == STICKER_ROUND:
+    if info["kind"] == "sticker":
         # Sticker Battle - avval admin'dan e'lon qilinadigan STIKER so'raymiz,
         # raund faqat shundan keyin (stiker+tarif kanalga ketgach) faollashadi.
-        await state.update_data(pending_round_num=round_num)
+        await state.update_data(pending_round_num=round_num, pending_tournament_id=tournament_id)
         await state.set_state(AdminStickerAnnounceStates.waiting_sticker)
         await call.message.edit_text(
             f"😂 <b>{info['name']}</b>\n\n"
@@ -598,22 +852,30 @@ async def adm_set_round(call: CallbackQuery, state: FSMContext):
         await call.answer()
         return
 
+    if info["kind"] == "assoc":
+        # Rasmga oidlik - admin bir nechta rasm yuboradi, so'ng ✅ Tayyor bosadi.
+        await state.update_data(pending_round_num=round_num, pending_tournament_id=tournament_id, assoc_images=[])
+        await state.set_state(AdminAssocStates.collecting_images)
+        await call.message.edit_text(
+            f"🖼 <b>{info['name']}</b>\n\n"
+            "Rasmlarni birma-bir botga yuboring (istagancha). Hammasini yuborib "
+            "bo'lgach, pastdagi ✅ Tayyor tugmasini bosing - shundagina rasmlar "
+            "RAQAMLANIB kanalga e'lon qilinadi.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Tayyor", callback_data="adm_assoc_done")]
+            ]),
+        )
+        await call.answer()
+        return
+
     await db.set_active_round(round_num)
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(True, round_num)
+        await admin_panel_text(), reply_markup=admin_panel_kb(True, tournament_id, round_num)
     )
     await call.answer(f"{info['name']} boshlandi!")
 
-    if round_num == WEBAPP_ROUND:
-        text = (
-            f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
-            "Bosh menyudagi \"⌨️ Tez yozish\" tugmasini bosib ishtirok eting!"
-        )
-    elif round_num in EXTERNAL_ROUNDS:
-        text = (
-            f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
-            f"{info['hint']}"
-        )
+    if info["kind"] == "external":
+        text = f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n{info['hint']}"
     else:
         text = (
             f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n"
@@ -622,6 +884,16 @@ async def adm_set_round(call: CallbackQuery, state: FSMContext):
         )
     await broadcast_to_users(text)
     await post_text_to_channel(text)
+
+    # Dart/Futbol/Basketbol/Bowling kabi "o'yin" raundlari uchun e'lon
+    # kanaldan tashqari muhokama/o'yin guruhiga (GAME_CHAT_ID) ham boriladi,
+    # chunki aynan shu roundlar o'sha yerda o'ynaladi.
+    if info.get("extra_target") == "game_chat" and config.GAME_CHAT_ID:
+        try:
+            await bot.send_message(config.GAME_CHAT_ID, text)
+        except Exception as e:
+            logger.error(f"GAME_CHAT_ID'ga e'lon yuborishda xatolik: {e}")
+
     asyncio.create_task(backup_db_to_telegram())
 
 
@@ -647,11 +919,12 @@ async def adm_sticker_caption_received(message: Message, state: FSMContext):
         return
     data = await state.get_data()
     round_num = data.get("pending_round_num")
+    tournament_id = data.get("pending_tournament_id") or await db.get_active_tournament()
     sticker_file_id = data.get("sticker_file_id")
     caption = message.text
     await state.clear()
 
-    info = config.ROUNDS[round_num]
+    info = get_rounds(tournament_id)[round_num]
     await db.set_active_round(round_num)
 
     # Kanalga: stiker + tarif
@@ -675,8 +948,77 @@ async def adm_sticker_caption_received(message: Message, state: FSMContext):
 
     await message.answer(
         f"✅ {info['name']} boshlandi va kanalga e'lon qilindi!",
-        reply_markup=admin_panel_kb(True, round_num),
+        reply_markup=admin_panel_kb(True, tournament_id, round_num),
     )
+    asyncio.create_task(backup_db_to_telegram())
+
+
+# ------------------------------------------------------------
+#  "RASMGA OIDLIK" - admin rasmlarni yig'ish oqimi
+# ------------------------------------------------------------
+
+@dp.message(StateFilter(AdminAssocStates.collecting_images), F.photo)
+async def adm_assoc_photo_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    images = data.get("assoc_images", [])
+    images.append(message.photo[-1].file_id)
+    await state.update_data(assoc_images=images)
+    await message.answer(f"🖼 {len(images)}-rasm qabul qilindi. Yana yuboring yoki ✅ Tayyor bosing.")
+
+
+@dp.message(StateFilter(AdminAssocStates.collecting_images))
+async def adm_assoc_wrong_type(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("❗️ Iltimos, aynan RASM yuboring (yoki ✅ Tayyor tugmasini bosing).")
+
+
+@dp.callback_query(F.data == "adm_assoc_done")
+async def adm_assoc_done(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    current_state = await state.get_state()
+    if current_state != AdminAssocStates.collecting_images.state:
+        return await call.answer("Bu tugma endi faol emas.", show_alert=True)
+
+    data = await state.get_data()
+    images = data.get("assoc_images", [])
+    round_num = data.get("pending_round_num")
+    tournament_id = data.get("pending_tournament_id") or await db.get_active_tournament()
+    if not images:
+        return await call.answer("❗️ Kamida bitta rasm yuboring!", show_alert=True)
+
+    info = get_rounds(tournament_id)[round_num]
+    await state.clear()
+
+    await db.clear_assoc_images(tournament_id, round_num)
+    for i, file_id in enumerate(images, start=1):
+        await db.add_assoc_image(tournament_id, round_num, i, file_id)
+    await db.set_active_round(round_num)
+
+    await call.answer("✅ E'lon qilinmoqda...")
+    await call.message.edit_text(
+        await admin_panel_text(), reply_markup=admin_panel_kb(True, tournament_id, round_num)
+    )
+
+    # Kanalga: avval qoida/tarif matni, keyin rasmlar RAQAMLAB
+    await post_text_to_channel(f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n{info['hint']}")
+    for i, file_id in enumerate(images, start=1):
+        try:
+            await bot.send_photo(config.CHANNEL_ID, photo=file_id, caption=f"{i}-rasm")
+        except Exception as e:
+            logger.error(f"Kanalga {i}-rasmni yuborishda xatolik: {e}")
+        await asyncio.sleep(0.05)
+
+    # Foydalanuvchilarga DM: matnli ko'rsatma (rasmlarni har biriga qayta
+    # yubormaymiz - ular kanalda ko'rinadi, ortiqcha flood'ning keragi yo'q)
+    dm_text = (
+        f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n{info['hint']}\n\n"
+        f"🖼 Rasmlarni kanalda ({config.CHANNEL_USERNAME}) ko'ring."
+    )
+    await broadcast_to_users(dm_text)
     asyncio.create_task(backup_db_to_telegram())
 
 
@@ -712,85 +1054,6 @@ async def adm_msguser_send(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Foydalanuvchiga xabar yuborishda xatolik: {e}")
         await message.answer("❌ Xabar yuborilmadi (ehtimol foydalanuvchi botni bloklagan yoki hech qachon /start bosmagan).")
-
-
-# ==================================================================
-#  JAVOBNI QABUL QILISH - FSM HOLATISIZ (muhim!)
-#
-#  Oldingi versiyada javob yuborish "kutish holati" (FSM) ga bog'liq edi.
-#  MemoryStorage botning operativ xotirasida saqlanadi va bot qayta ishga
-#  tushganda (masalan har deploy'da) BUTUNLAY o'chib ketadi - shu sabab
-#  "tugmani bosgan, lekin ulgurmagan" foydalanuvchilarning javoblari
-#  yo'qolib qolardi. Endi javob HECH QANDAY holatga bog'liq emas -
-#  ro'yxatdan o'tgan foydalanuvchi mos formatda(matn/rasm/stiker/ovoz)
-#  xabar yuborsa, faol raund uchun to'g'ridan-to'g'ri qabul qilinadi.
-# ==================================================================
-
-@dp.message(
-    F.content_type.in_({
-        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
-        ContentType.VOICE, ContentType.AUDIO,
-    })
-)
-async def receive_answer(message: Message):
-    if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
-        return
-
-    if not await db.is_registered(message.from_user.id):
-        return  # ro'yxatdan o'tmagan - sukut (spam bo'lmasin)
-    if not await db.is_tournament_active():
-        return
-    round_num = await db.get_active_round()
-    if not round_num or round_num in EXTERNAL_ROUNDS or round_num == WEBAPP_ROUND:
-        return
-    if await db.has_answered(message.from_user.id, round_num):
-        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
-        return
-
-    content_type = None
-    text_content = None
-    file_id = None
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        if message.caption:
-            content_type = "photo_text"
-            text_content = message.caption
-        else:
-            content_type = "photo"
-    elif message.sticker:
-        content_type = "sticker"
-        file_id = message.sticker.file_id
-    elif message.voice:
-        content_type = "voice"
-        file_id = message.voice.file_id
-    elif message.audio:
-        content_type = "audio"
-        file_id = message.audio.file_id
-    elif message.text:
-        content_type = "text"
-        text_content = message.text
-    else:
-        return
-
-    answer_id = await db.add_answer(
-        tg_id=message.from_user.id,
-        round_num=round_num,
-        content_type=content_type,
-        text_content=text_content,
-        file_id=file_id,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-    )
-
-    await message.answer(
-        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
-        reply_markup=await main_menu_kb(),
-    )
-
-    await notify_admins_new_answer(
-        answer_id=answer_id, user=message.from_user, round_num=round_num, content_type=content_type,
-    )
 
 
 # ==================================================================
@@ -861,8 +1124,6 @@ async def adm_msguser_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-
-
 @dp.callback_query(F.data == "adm_export")
 async def adm_export(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -910,7 +1171,9 @@ async def adm_clear_answers_go(call: CallbackQuery):
     await db.clear_answers()
     await call.message.edit_text(
         await admin_panel_text(),
-        reply_markup=admin_panel_kb(await db.is_tournament_active(), await db.get_active_round()),
+        reply_markup=admin_panel_kb(
+            await db.is_tournament_active(), await db.get_active_tournament(), await db.get_active_round()
+        ),
     )
     await call.answer("✅ Javoblar tarixi tozalandi.", show_alert=True)
     asyncio.create_task(backup_db_to_telegram())
@@ -940,14 +1203,15 @@ async def adm_clear_all_go(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     await db.clear_all_data()
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0)
+        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0, 0)
     )
     await call.answer("✅ Barcha ma'lumotlar tozalandi.", show_alert=True)
     asyncio.create_task(backup_db_to_telegram())
 
 
 async def export_answers_to_excel(message: Message):
-    """Barcha javoblarni .xlsx faylga yig'ib, chatga yuboradi."""
+    """Barcha javoblarni .xlsx faylga yig'ib, chatga yuboradi (AI baholovi ham
+    kiritilgan - 'Rasmga oidlik' raundi uchun ball/to'g'ri/noto'g'ri so'zlar)."""
     from openpyxl import Workbook
 
     rows = await db.get_all_answers()
@@ -956,16 +1220,20 @@ async def export_answers_to_excel(message: Message):
     ws = wb.active
     ws.title = "Javoblar"
     headers = [
-        "ID", "Telegram ID", "Ism-Familiya", "Username", "Raund",
-        "Turi", "Matn", "File ID", "WPM", "Vaqt (s)", "Yuborilgan vaqt",
+        "ID", "Telegram ID", "Ism-Familiya", "Username", "Turnir", "Raund",
+        "Turi", "Matn", "Rasm #", "AI ball", "AI to'g'ri", "AI noto'g'ri",
+        "File ID", "WPM", "Vaqt (s)", "Yuborilgan vaqt",
     ]
     ws.append(headers)
 
     for r in rows:
-        round_name = config.ROUNDS.get(r["round_num"], {}).get("name", r["round_num"])
+        tournament_id = r["tournament_id"] or 100
+        t_name = config.TOURNAMENTS.get(tournament_id, {}).get("name", tournament_id)
+        round_name = get_rounds(tournament_id).get(r["round_num"], {}).get("name", r["round_num"])
         ws.append([
-            r["id"], r["tg_id"], r["full_name"] or "", r["username"] or "",
+            r["id"], r["tg_id"], r["full_name"] or "", r["username"] or "", t_name,
             round_name, r["content_type"] or "", r["text_content"] or "",
+            r["ref_num"], r["ai_score"], r["ai_correct"] or "", r["ai_incorrect"] or "",
             r["file_id"] or "", r["wpm"], r["time_sec"], r["submitted_at"],
         ])
 
@@ -1036,8 +1304,6 @@ async def periodic_backup_loop() -> None:
     while True:
         await asyncio.sleep(120)
         await backup_db_to_telegram()
-
-
 
 
 async def main():
