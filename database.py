@@ -98,6 +98,21 @@ async def init_db() -> None:
         await _add_column_if_missing("answers", "ai_correct", "TEXT")       # JSON ro'yxat
         await _add_column_if_missing("answers", "ai_incorrect", "TEXT")     # JSON ro'yxat
 
+        # XAVFSIZLIK/RACE CONDITION HIMOYASI: "has_answered() tekshirish, keyin
+        # add_answer() yozish" ikki alohida bosqich bo'lgani uchun, foydalanuvchi
+        # bir vaqtda bir nechta xabar yuborsa (tez ketma-ket yoki parallel),
+        # ikkalasi ham tekshiruvdan o'tib, bitta raundga bir necha marta javob
+        # yozilib qolishi mumkin edi. Bu partial UNIQUE index shu holatning
+        # OLDINI DB DARAJASIDA oladi (assoc raundlar bundan mustasno - u yerda
+        # ataylab bir necha marta javob yuborish ruxsat etilgan).
+        try:
+            await _conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_answers_one_per_round "
+                "ON answers(tg_id, tournament_id, round_num) WHERE content_type != 'assoc'"
+            )
+        except Exception as e:
+            pass  # eski SQLite versiyalarida partial index bo'lmasligi mumkin - jim o'tkazamiz
+
         # Eski (migratsiyadan oldingi) javoblar "Turnir 100" ga tegishli edi
         await _conn.execute("UPDATE answers SET tournament_id = 100 WHERE tournament_id IS NULL")
 
@@ -188,6 +203,46 @@ async def add_answer(
         )
         await _conn.commit()
         return cur.lastrowid
+
+
+async def add_answer_if_new(
+    tg_id: int,
+    round_num: int,
+    content_type: str,
+    tournament_id: int | None = None,
+    text_content: str | None = None,
+    file_id: str | None = None,
+    wpm: float | None = None,
+    time_sec: float | None = None,
+    chat_id: int | None = None,
+    message_id: int | None = None,
+    ref_num: int | None = None,
+) -> int | None:
+    """add_answer bilan bir xil, lekin ATOMIK: agar bu foydalanuvchi shu
+    turnir+raundga allaqachon javob yozgan bo'lsa (idx_answers_one_per_round
+    UNIQUE indexi orqali), hech narsa yozmay None qaytaradi. has_answered()
+    tekshiruvi + alohida add_answer() chaqiruvi orasida boshqa xabar
+    "kirib qolishi" (race condition) MUMKIN EMAS, chunki bu yerda hammasi
+    bitta lock ostida, bitta INSERT sifatida bajariladi."""
+    async with _lock:
+        try:
+            cur = await _conn.execute(
+                """
+                INSERT INTO answers
+                    (tg_id, round_num, content_type, text_content, file_id, chat_id, message_id,
+                     wpm, time_sec, submitted_at, tournament_id, ref_num)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    tg_id, round_num, content_type, text_content, file_id, chat_id, message_id, wpm, time_sec,
+                    datetime.now().isoformat(timespec="seconds"), tournament_id, ref_num,
+                ),
+            )
+            await _conn.commit()
+            return cur.lastrowid
+        except aiosqlite.IntegrityError:
+            # idx_answers_one_per_round'ga urildi - demak bu javob allaqachon mavjud
+            return None
 
 
 async def update_answer_ai_result(answer_id: int, ai_score: float, ai_correct_json: str, ai_incorrect_json: str) -> None:

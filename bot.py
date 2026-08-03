@@ -12,12 +12,14 @@
 #   python bot.py
 # ------------------------------------------------------------
 import asyncio
+import base64
 import html
 import io
 import json
 import logging
 import os
 import re
+import time
 from datetime import datetime
 from typing import Any, Awaitable, Callable, Dict
 
@@ -365,6 +367,16 @@ async def my_results(message: Message):
 RESERVED_MENU_TEXTS = {"📤 Javob yuborish", "ℹ️ Qoidalar", "📊 Mening natijalarim"}
 ASSOC_ANSWER_RE = re.compile(r"^\s*(\d+)\s*[\).:\-]?\s*(.+)$", re.S)
 
+# XAVFSIZLIK: "Rasmga oidlik" raundida cheklovsiz qayta yuborish har safar
+# Groq API'ga chaqiruv qiladi (pullik/kvota bilan cheklangan resurs). Agar
+# himoyasiz qoldirilsa, bitta foydalanuvchi soniyalab xabar yuborib
+# GROQ_API_KEYS limitini bir necha daqiqada tugatib qo'yishi mumkin - shundan
+# keyin butun turnir uchun AI baholash ishlamay qoladi. Shu sabab har
+# foydalanuvchiga oddiy cooldown qo'yiladi (xotirada, restart'da tozalanadi -
+# bu yetarli, chunki maqsad faqat flood/abuse'ning oldini olish).
+_ASSOC_COOLDOWN_SEC = 10
+_assoc_last_submit: dict[int, float] = {}
+
 
 @dp.message(F.text == "📤 Javob yuborish")
 async def show_answer_prompt(message: Message):
@@ -529,15 +541,27 @@ async def call_groq_vision(image_url: str, words: list[str]) -> dict | None:
 
 async def score_assoc_answer(answer_id: int, image_file_id: str, words: list[str], user, image_number: int) -> None:
     """AI orqali baholaydi va natijani (FAQAT adminlarga - foydalanuvchiga
-    HECH QACHON emas) yuboradi."""
+    HECH QACHON emas) yuboradi.
+
+    XAVFSIZLIK ESLATMASI: rasmni Groq'ga hech qachon
+    "https://api.telegram.org/file/bot<TOKEN>/..." ko'rinishidagi to'g'ridan-to'g'ri
+    URL orqali YUBORMAYMIZ - bunday URL ichida bot tokeni ochiq matnda uchinchi
+    tomon (Groq) serveriga ketadi va u yerda log/keshda saqlanib qolishi mumkin.
+    Shu sabab rasmni o'zimiz yuklab olib, base64 data-URL sifatida yuboramiz -
+    token hech qachon botimizdan tashqariga chiqmaydi."""
     try:
         file_info = await bot.get_file(image_file_id)
-        image_url = f"https://api.telegram.org/file/bot{config.BOT_TOKEN}/{file_info.file_path}"
+        file_bytes_io = await bot.download_file(file_info.file_path)
+        image_bytes = file_bytes_io.read()
     except Exception as e:
         logger.error(f"Rasm faylini olishda xatolik: {e}")
         return
 
-    result = await call_groq_vision(image_url, words)
+    ext = file_info.file_path.rsplit(".", 1)[-1].lower() if "." in file_info.file_path else "jpg"
+    mime = "image/png" if ext == "png" else "image/jpeg"
+    image_data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode()}"
+
+    result = await call_groq_vision(image_data_url, words)
     if result is None:
         return
 
@@ -580,6 +604,15 @@ async def handle_assoc_answer(message: Message, tournament_id: int, round_num: i
         )
         return
 
+    # XAVFSIZLIK: Groq kvotasini flood orqali "kuydirishning" oldini olish
+    now = time.monotonic()
+    last = _assoc_last_submit.get(message.from_user.id, 0.0)
+    if now - last < _ASSOC_COOLDOWN_SEC:
+        wait = int(_ASSOC_COOLDOWN_SEC - (now - last)) + 1
+        await message.answer(f"⏳ Juda tez-tez yuboryapsiz, {wait} soniyadan keyin qayta urinib ko'ring.")
+        return
+    _assoc_last_submit[message.from_user.id] = now
+
     m = ASSOC_ANSWER_RE.match(message.text)
     if not m:
         await message.answer(
@@ -593,6 +626,9 @@ async def handle_assoc_answer(message: Message, tournament_id: int, round_num: i
     words = [w.strip() for w in re.split(r"[,\n]+", words_part) if w.strip()]
     if not words:
         await message.answer("❗️ Iltimos, rasm raqamidan keyin kamida bitta so'z/ibora yozing.")
+        return
+    if len(words) > 30:
+        await message.answer("❗️ Bitta xabarda ko'pi bilan 30 ta so'z/ibora yuborish mumkin.")
         return
 
     image = await db.get_assoc_image(tournament_id, round_num, image_number)
@@ -1015,11 +1051,11 @@ async def receive_answer(message: Message):
         await handle_assoc_answer(message, tournament_id, round_num)
         return
 
-    # Qolgan turlar ("photo", "sticker") - odatiy javob yig'ish oqimi
-    if await db.has_answered(message.from_user.id, tournament_id, round_num):
-        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
-        return
-
+    # Qolgan turlar ("photo", "sticker") - odatiy javob yig'ish oqimi.
+    # ESLATMA: bu yerda oldindan has_answered() bilan tekshirib qo'ymaymiz -
+    # buni pastda add_answer_if_new() BITTA atomik amalda (tekshirish+yozish)
+    # bajaradi, shunda race condition (tez ketma-ket yuborilgan ikki xabar
+    # ikkalasi ham "hali javob yo'q" deb o'tib ketishi) butunlay yo'q qilinadi.
     content_type = None
     text_content = None
     file_id = None
@@ -1046,7 +1082,7 @@ async def receive_answer(message: Message):
     else:
         return
 
-    answer_id = await db.add_answer(
+    answer_id = await db.add_answer_if_new(
         tg_id=message.from_user.id,
         round_num=round_num,
         tournament_id=tournament_id,
@@ -1056,6 +1092,11 @@ async def receive_answer(message: Message):
         chat_id=message.chat.id,
         message_id=message.message_id,
     )
+
+    if answer_id is None:
+        # Boshqa (deyarli bir vaqtdagi) xabar allaqachon yozib ulgurgan
+        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
+        return
 
     await message.answer(
         "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",

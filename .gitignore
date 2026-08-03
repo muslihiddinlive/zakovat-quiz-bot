@@ -1,4 +1,11 @@
 __pycache__/
 *.pyc
 zakovat_quiz.db
+zakovat_quiz.db-shm
+zakovat_quiz.db-wal
+zakovat_quiz.db-journal
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
 .env
