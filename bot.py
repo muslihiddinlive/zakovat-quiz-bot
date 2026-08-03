@@ -114,7 +114,7 @@ def subscribe_kb() -> InlineKeyboardMarkup:
     )
 
 
-def admin_panel_kb(tournament_active: bool, active_tournament: int, active_round: int) -> InlineKeyboardMarkup:
+async def admin_panel_kb(tournament_active: bool, active_tournament: int, active_round: int) -> InlineKeyboardMarkup:
     rows = []
     if tournament_active:
         rows.append([InlineKeyboardButton(text="⏹ Turnirni to'xtatish", callback_data="adm_stop")])
@@ -130,6 +130,13 @@ def admin_panel_kb(tournament_active: bool, active_tournament: int, active_round
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
     rows.append([InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="adm_users_0")])
     rows.append([InlineKeyboardButton(text="💾 Zaxira olish (qo'lda)", callback_data="adm_backup_now")])
+
+    # TEST REJIMI: yoniq bo'lsa kanalga/foydalanuvchilarga HECH NARSA
+    # ketmaydi - faqat admin(lar)ga simulyatsiya ko'rinishida yuboriladi.
+    test_mode = await db.is_test_mode()
+    test_label = "🧪 Test rejimi: YONIQ (o'chirish)" if test_mode else "🧪 Test rejimi: O'CHIQ (yoqish)"
+    rows.append([InlineKeyboardButton(text=test_label, callback_data="adm_toggle_test")])
+
     rows.append([InlineKeyboardButton(text="🗑 Javoblar tarixini tozalash", callback_data="adm_clear_answers")])
     rows.append([InlineKeyboardButton(text="⚠️ To'liq tozalash (userlar ham)", callback_data="adm_clear_all")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -160,8 +167,30 @@ def admin_round_picker_kb(tournament_id: int) -> InlineKeyboardMarkup:
 #  KANALGA E'LON YUBORISH (bot @ParadoksHub kanalida admin huquqiga ega)
 # ==================================================================
 
+async def _test_mode_targets() -> list[int]:
+    targets = [config.ADMIN_GROUP_ID]
+    if config.PERSONAL_CHAT_ID:
+        targets.append(config.PERSONAL_CHAT_ID)
+    return targets
+
+
+async def send_test_mode_notice(text: str) -> None:
+    """TEST REJIMI yoniq bo'lganda, kanalga/userlarga ketishi kerak bo'lgan
+    xabar o'rniga shu funksiya orqali FAQAT admin(lar)ga [TEST] belgisi bilan
+    yuboriladi - hech kim boshqa buni ko'rmaydi."""
+    for chat_id in await _test_mode_targets():
+        try:
+            await bot.send_message(chat_id, text)
+        except Exception as e:
+            logger.error(f"Test rejimi xabarini {chat_id}'ga yuborishda xatolik: {e}")
+
+
 async def post_text_to_channel(text: str) -> None:
-    """Kanalga oddiy matnli e'lon yuboradi."""
+    """Kanalga oddiy matnli e'lon yuboradi. TEST REJIMIDA kanalga ketmaydi -
+    o'rniga admin(lar)ga [TEST] belgisi bilan simulyatsiya yuboriladi."""
+    if await db.is_test_mode():
+        await send_test_mode_notice(f"🧪 <b>[TEST] Kanalga ketishi kerak edi:</b>\n\n{text}")
+        return
     try:
         await bot.send_message(config.CHANNEL_ID, text)
     except Exception as e:
@@ -170,7 +199,14 @@ async def post_text_to_channel(text: str) -> None:
 
 async def post_sticker_to_channel(sticker_file_id: str, caption: str | None = None) -> None:
     """Kanalga stiker, so'ng (agar berilsa) tarif matnini alohida xabar sifatida yuboradi
-    (Telegram stikerlarda caption maydoni yo'q, shuning uchun ikkita xabar bo'ladi)."""
+    (Telegram stikerlarda caption maydoni yo'q, shuning uchun ikkita xabar bo'ladi).
+    TEST REJIMIDA kanalga ketmaydi - o'rniga admin(lar)ga simulyatsiya yuboriladi."""
+    if await db.is_test_mode():
+        await send_test_mode_notice(
+            f"🧪 <b>[TEST] Stiker kanalga ketishi kerak edi</b> (file_id: <code>{sticker_file_id}</code>)"
+            + (f"\nTarif: {caption}" if caption else "")
+        )
+        return
     try:
         await bot.send_sticker(config.CHANNEL_ID, sticker=sticker_file_id)
         if caption:
@@ -674,14 +710,17 @@ async def admin_panel_text() -> str:
     tournament_active = await db.is_tournament_active()
     active_tournament = await db.get_active_tournament()
     active_round = await db.get_active_round()
+    test_mode = await db.is_test_mode()
     status = "🟢 Faol" if tournament_active else "🔴 Faol emas"
     t_name = config.TOURNAMENTS.get(active_tournament, {}).get("name", "tanlanmagan") if active_tournament else "tanlanmagan"
     round_text = get_rounds(active_tournament).get(active_round, {}).get("name", "yo'q") if active_round else "yo'q"
+    test_status = "🧪 YONIQ - kanalga/userlarga hech narsa ketmaydi!" if test_mode else "O'chiq"
     return (
         f"🛠 <b>Admin panel</b>\n"
         f"Turnir holati: {status}\n"
         f"Tanlangan turnir: {t_name}\n"
-        f"Hozirgi faol raund: {round_text}"
+        f"Hozirgi faol raund: {round_text}\n"
+        f"Test rejimi: {test_status}"
     )
 
 
@@ -695,7 +734,7 @@ async def cmd_admin(message: Message):
     active_round = await db.get_active_round()
     await message.answer(
         await admin_panel_text(),
-        reply_markup=admin_panel_kb(tournament_active, active_tournament, active_round),
+        reply_markup=await admin_panel_kb(tournament_active, active_tournament, active_round),
     )
 
 
@@ -744,7 +783,7 @@ async def adm_stop(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     await db.set_tournament_active(False)
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0, 0)
+        await admin_panel_text(), reply_markup=await admin_panel_kb(False, 0, 0)
     )
     await call.answer("Turnir to'xtatildi!")
     end_text = "🏁 Turnir yakunlandi! Rahmat, barchangizga!\n🏆 G'oliblar ERTAGA e'lon qilinadi!"
@@ -761,9 +800,30 @@ async def adm_back(call: CallbackQuery):
     active_tournament = await db.get_active_tournament()
     active_round = await db.get_active_round()
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(tournament_active, active_tournament, active_round)
+        await admin_panel_text(), reply_markup=await admin_panel_kb(tournament_active, active_tournament, active_round)
     )
     await call.answer()
+
+
+@dp.callback_query(F.data == "adm_toggle_test")
+async def adm_toggle_test(call: CallbackQuery):
+    """TEST REJIMINI yoqadi/o'chiradi. Yoniq bo'lganda: kanalga hech qanday
+    post ketmaydi, ro'yxatdan o'tgan foydalanuvchilarga HECH QANDAY broadcast
+    ketmaydi - buning o'rniga hammasi faqat admin(lar)ga [TEST] belgisi bilan
+    simulyatsiya ko'rinishida yuboriladi. Boshqa hamma funksiya (raund
+    tanlash, javob qabul qilish, admin panel va h.k.) xuddi avvalgidek ishlayveradi."""
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    new_state = not await db.is_test_mode()
+    await db.set_test_mode(new_state)
+    tournament_active = await db.is_tournament_active()
+    active_tournament = await db.get_active_tournament()
+    active_round = await db.get_active_round()
+    await call.message.edit_text(
+        await admin_panel_text(),
+        reply_markup=await admin_panel_kb(tournament_active, active_tournament, active_round),
+    )
+    await call.answer("🧪 Test rejimi YONDI!" if new_state else "✅ Test rejimi o'chdi, hammasi haqiqiy ketadi.", show_alert=True)
 
 
 @dp.callback_query(F.data == "adm_pick_round")
@@ -823,7 +883,7 @@ async def adm_set_round(call: CallbackQuery, state: FSMContext):
 
     await db.set_active_round(round_num)
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(True, tournament_id, round_num)
+        await admin_panel_text(), reply_markup=await admin_panel_kb(True, tournament_id, round_num)
     )
     await call.answer(f"{info['name']} boshlandi!")
 
@@ -880,28 +940,34 @@ async def adm_sticker_caption_received(message: Message, state: FSMContext):
     info = get_rounds(tournament_id)[round_num]
     await db.set_active_round(round_num)
 
-    # Kanalga: stiker + tarif
+    # Kanalga: stiker + tarif (test rejimida avtomatik admin(lar)ga yo'naladi)
     await post_sticker_to_channel(sticker_file_id, caption=f"🎬 {info['name']}\n\n{caption}")
     # Ro'yxatdan o'tgan foydalanuvchilarga ham bir xil tarzda
-    try:
-        kb = await main_menu_kb()
-        for tg_id in await db.get_all_user_ids():
-            try:
-                await bot.send_sticker(tg_id, sticker=sticker_file_id)
-                await bot.send_message(
-                    tg_id, f"🎬 <b>{info['name']}</b>\n\n{caption}\n\n"
-                    "Javobingizni \"📤 Javob yuborish\" orqali stiker sifatida yuboring!",
-                    reply_markup=kb,
-                )
-            except Exception as e:
-                logger.warning(f"Sticker broadcast {tg_id}'ga yetmadi: {e}")
-            await asyncio.sleep(0.05)
-    except Exception as e:
-        logger.error(f"Sticker broadcast xatosi: {e}")
+    if await db.is_test_mode():
+        user_count = len(await db.get_all_user_ids())
+        await send_test_mode_notice(
+            f"🧪 <b>[TEST] Sticker broadcast {user_count} ta foydalanuvchiga ketishi kerak edi.</b>"
+        )
+    else:
+        try:
+            kb = await main_menu_kb()
+            for tg_id in await db.get_all_user_ids():
+                try:
+                    await bot.send_sticker(tg_id, sticker=sticker_file_id)
+                    await bot.send_message(
+                        tg_id, f"🎬 <b>{info['name']}</b>\n\n{caption}\n\n"
+                        "Javobingizni \"📤 Javob yuborish\" orqali stiker sifatida yuboring!",
+                        reply_markup=kb,
+                    )
+                except Exception as e:
+                    logger.warning(f"Sticker broadcast {tg_id}'ga yetmadi: {e}")
+                await asyncio.sleep(0.05)
+        except Exception as e:
+            logger.error(f"Sticker broadcast xatosi: {e}")
 
     await message.answer(
         f"✅ {info['name']} boshlandi va kanalga e'lon qilindi!",
-        reply_markup=admin_panel_kb(True, tournament_id, round_num),
+        reply_markup=await admin_panel_kb(True, tournament_id, round_num),
     )
     asyncio.create_task(backup_db_to_telegram())
 
@@ -953,17 +1019,21 @@ async def adm_assoc_done(call: CallbackQuery, state: FSMContext):
 
     await call.answer("✅ E'lon qilinmoqda...")
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(True, tournament_id, round_num)
+        await admin_panel_text(), reply_markup=await admin_panel_kb(True, tournament_id, round_num)
     )
 
     # Kanalga: avval qoida/tarif matni, keyin rasmlar RAQAMLAB
+    # (test rejimida post_text_to_channel avtomatik admin(lar)ga yo'naladi)
     await post_text_to_channel(f"🎬 Yangi raund boshlandi: <b>{info['name']}</b>\n\n{info['hint']}")
-    for i, file_id in enumerate(images, start=1):
-        try:
-            await bot.send_photo(config.CHANNEL_ID, photo=file_id, caption=f"{i}-rasm")
-        except Exception as e:
-            logger.error(f"Kanalga {i}-rasmni yuborishda xatolik: {e}")
-        await asyncio.sleep(0.05)
+    if await db.is_test_mode():
+        await send_test_mode_notice(f"🧪 <b>[TEST] {len(images)} ta rasm kanalga ketishi kerak edi.</b>")
+    else:
+        for i, file_id in enumerate(images, start=1):
+            try:
+                await bot.send_photo(config.CHANNEL_ID, photo=file_id, caption=f"{i}-rasm")
+            except Exception as e:
+                logger.error(f"Kanalga {i}-rasmni yuborishda xatolik: {e}")
+            await asyncio.sleep(0.05)
 
     # Foydalanuvchilarga DM: matnli ko'rsatma (rasmlarni har biriga qayta
     # yubormaymiz - ular kanalda ko'rinadi, ortiqcha flood'ning keragi yo'q)
@@ -977,7 +1047,15 @@ async def adm_assoc_done(call: CallbackQuery, state: FSMContext):
 
 async def broadcast_to_users(text: str) -> None:
     """Barcha ro'yxatdan o'tgan foydalanuvchilarga xabar yuboradi (yangilangan
-    tugmalar bilan), masalan yangi raund boshlanganda."""
+    tugmalar bilan), masalan yangi raund boshlanganda.
+    TEST REJIMIDA hech kimga ketmaydi - o'rniga admin(lar)ga nechta userga
+    ketishi kerak ediligi va matni [TEST] belgisi bilan yuboriladi."""
+    if await db.is_test_mode():
+        user_count = len(await db.get_all_user_ids())
+        await send_test_mode_notice(
+            f"🧪 <b>[TEST] Broadcast {user_count} ta foydalanuvchiga ketishi kerak edi:</b>\n\n{text}"
+        )
+        return
     kb = await main_menu_kb()
     user_ids = await db.get_all_user_ids()
     sent, failed = 0, 0
@@ -1224,7 +1302,7 @@ async def adm_clear_answers_go(call: CallbackQuery):
     await db.clear_answers()
     await call.message.edit_text(
         await admin_panel_text(),
-        reply_markup=admin_panel_kb(
+        reply_markup=await admin_panel_kb(
             await db.is_tournament_active(), await db.get_active_tournament(), await db.get_active_round()
         ),
     )
@@ -1256,7 +1334,7 @@ async def adm_clear_all_go(call: CallbackQuery):
         return await call.answer("⛔️", show_alert=True)
     await db.clear_all_data()
     await call.message.edit_text(
-        await admin_panel_text(), reply_markup=admin_panel_kb(False, 0, 0)
+        await admin_panel_text(), reply_markup=await admin_panel_kb(False, 0, 0)
     )
     await call.answer("✅ Barcha ma'lumotlar tozalandi.", show_alert=True)
     asyncio.create_task(backup_db_to_telegram())

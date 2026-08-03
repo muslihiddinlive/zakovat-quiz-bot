@@ -131,6 +131,11 @@ async def init_db() -> None:
         await _conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('active_tournament', '0')"
         )
+        # test_mode: 1 = yoniq. Yoniq bo'lsa kanalga/userlarga HAQIQIY xabar
+        # ketmaydi, faqat admin(lar)ga simulyatsiya ko'rinishida yuboriladi.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('test_mode', '0')"
+        )
         await _conn.commit()
 
 
@@ -378,6 +383,17 @@ async def set_active_round(round_num: int) -> None:
     """Yangi raundni faol qiladi - shu bilan avvalgi faol raund AVTOMATIK yopiladi
     (chunki bir vaqtning o'zida faqat bitta raund faol bo'lishi mumkin)."""
     await set_setting("active_round", str(round_num))
+
+
+async def is_test_mode() -> bool:
+    """TEST REJIMI yoniqmi? Yoniq bo'lsa, kanalga va foydalanuvchilarga
+    HAQIQIY xabar/broadcast ketmaydi - faqat admin(lar)ga simulyatsiya ko'rinishida boradi."""
+    val = await get_setting("test_mode")
+    return val == "1"
+
+
+async def set_test_mode(active: bool) -> None:
+    await set_setting("test_mode", "1" if active else "0")
 
 
 async def clear_answers() -> None:
