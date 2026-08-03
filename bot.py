@@ -626,89 +626,6 @@ async def handle_assoc_answer(message: Message, tournament_id: int, round_num: i
     )
 
 
-@dp.message(
-    F.content_type.in_({
-        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
-        ContentType.VOICE, ContentType.AUDIO,
-    })
-)
-async def receive_answer(message: Message):
-    if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
-        return
-
-    if not await db.is_registered(message.from_user.id):
-        return  # ro'yxatdan o'tmagan - sukut (spam bo'lmasin)
-    if not await db.is_tournament_active():
-        return
-
-    tournament_id = await db.get_active_tournament()
-    rounds = get_rounds(tournament_id)
-    round_num = await db.get_active_round()
-    if not round_num or round_num not in rounds:
-        return
-
-    info = rounds[round_num]
-
-    if info["kind"] == "external":
-        return  # bot bu raundni umuman boshqarmaydi, javob yig'maydi
-
-    if info["kind"] == "assoc":
-        await handle_assoc_answer(message, tournament_id, round_num)
-        return
-
-    # Qolgan turlar ("photo", "sticker") - odatiy javob yig'ish oqimi
-    if await db.has_answered(message.from_user.id, tournament_id, round_num):
-        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
-        return
-
-    content_type = None
-    text_content = None
-    file_id = None
-
-    if message.photo:
-        file_id = message.photo[-1].file_id
-        if message.caption:
-            content_type = "photo_text"
-            text_content = message.caption
-        else:
-            content_type = "photo"
-    elif message.sticker:
-        content_type = "sticker"
-        file_id = message.sticker.file_id
-    elif message.voice:
-        content_type = "voice"
-        file_id = message.voice.file_id
-    elif message.audio:
-        content_type = "audio"
-        file_id = message.audio.file_id
-    elif message.text:
-        content_type = "text"
-        text_content = message.text
-    else:
-        return
-
-    answer_id = await db.add_answer(
-        tg_id=message.from_user.id,
-        round_num=round_num,
-        tournament_id=tournament_id,
-        content_type=content_type,
-        text_content=text_content,
-        file_id=file_id,
-        chat_id=message.chat.id,
-        message_id=message.message_id,
-    )
-
-    await message.answer(
-        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
-        reply_markup=await main_menu_kb(),
-    )
-
-    await notify_admins_new_answer(
-        answer_id=answer_id, user=message.from_user, round_num=round_num,
-        content_type=content_type, tournament_id=tournament_id,
-    )
-
-
 # ==================================================================
 #  ADMIN PANEL
 # ==================================================================
@@ -1054,6 +971,101 @@ async def adm_msguser_send(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Foydalanuvchiga xabar yuborishda xatolik: {e}")
         await message.answer("❌ Xabar yuborilmadi (ehtimol foydalanuvchi botni bloklagan yoki hech qachon /start bosmagan).")
+
+
+# ==================================================================
+#  JAVOBNI QABUL QILISH - FSM HOLATISIZ (muhim!)
+#
+#  MUHIM: bu handler eng OXIRGI @dp.message bo'lib ro'yxatga olinishi SHART.
+#  Aiogram xabar handlerlarini RO'YXATGA OLISH TARTIBIDA tekshiradi va birinchi
+#  mos kelgan filtrda to'xtaydi. Bu handlerning filtri (content_type) deyarli
+#  har qanday matn/rasm/stiker/ovoz xabariga mos keladi - shuning uchun agar
+#  u boshqa (masalan /admin buyrug'i yoki admin FSM holatlari uchun) handlerlardan
+#  OLDIN turib qolsa, o'sha handlerlar HECH QACHON ishga tushmaydi (ular
+#  "ko'rinmas" bo'lib qoladi). Shu sabab bu blok fayl OXIRIDA turishi kerak.
+# ==================================================================
+
+@dp.message(
+    F.content_type.in_({
+        ContentType.TEXT, ContentType.PHOTO, ContentType.STICKER,
+        ContentType.VOICE, ContentType.AUDIO,
+    })
+)
+async def receive_answer(message: Message):
+    if message.text and (message.text in RESERVED_MENU_TEXTS or message.text.startswith("/")):
+        return
+
+    if not await db.is_registered(message.from_user.id):
+        return  # ro'yxatdan o'tmagan - sukut (spam bo'lmasin)
+    if not await db.is_tournament_active():
+        return
+
+    tournament_id = await db.get_active_tournament()
+    rounds = get_rounds(tournament_id)
+    round_num = await db.get_active_round()
+    if not round_num or round_num not in rounds:
+        return
+
+    info = rounds[round_num]
+
+    if info["kind"] == "external":
+        return  # bot bu raundni umuman boshqarmaydi, javob yig'maydi
+
+    if info["kind"] == "assoc":
+        await handle_assoc_answer(message, tournament_id, round_num)
+        return
+
+    # Qolgan turlar ("photo", "sticker") - odatiy javob yig'ish oqimi
+    if await db.has_answered(message.from_user.id, tournament_id, round_num):
+        await message.answer("⚠️ Siz bu raundda allaqachon ishtirok etgansiz, qayta yuborib bo'lmaydi.")
+        return
+
+    content_type = None
+    text_content = None
+    file_id = None
+
+    if message.photo:
+        file_id = message.photo[-1].file_id
+        if message.caption:
+            content_type = "photo_text"
+            text_content = message.caption
+        else:
+            content_type = "photo"
+    elif message.sticker:
+        content_type = "sticker"
+        file_id = message.sticker.file_id
+    elif message.voice:
+        content_type = "voice"
+        file_id = message.voice.file_id
+    elif message.audio:
+        content_type = "audio"
+        file_id = message.audio.file_id
+    elif message.text:
+        content_type = "text"
+        text_content = message.text
+    else:
+        return
+
+    answer_id = await db.add_answer(
+        tg_id=message.from_user.id,
+        round_num=round_num,
+        tournament_id=tournament_id,
+        content_type=content_type,
+        text_content=text_content,
+        file_id=file_id,
+        chat_id=message.chat.id,
+        message_id=message.message_id,
+    )
+
+    await message.answer(
+        "✅ Javobingiz qabul qilindi va hakamlarga yuborildi!",
+        reply_markup=await main_menu_kb(),
+    )
+
+    await notify_admins_new_answer(
+        answer_id=answer_id, user=message.from_user, round_num=round_num,
+        content_type=content_type, tournament_id=tournament_id,
+    )
 
 
 # ==================================================================
