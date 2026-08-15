@@ -45,6 +45,7 @@ from aiogram.types import (
 
 import config
 import database as db
+import ai_providers
 
 
 logging.basicConfig(level=logging.INFO)
@@ -80,6 +81,12 @@ class AdminAssocStates(StatesGroup):
 
 class AdminMessageUserStates(StatesGroup):
     waiting_message = State()
+
+
+class AdminAIKeyStates(StatesGroup):
+    """AI provayder kaliti qo'shish: avval provayder tanlanadi (tugma orqali),
+    so'ng shu holatda kalit matn sifatida kutiladi."""
+    waiting_key = State()
 
 
 # ==================================================================
@@ -129,6 +136,7 @@ async def admin_panel_kb(tournament_active: bool, active_tournament: int, active
     )])
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
     rows.append([InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="adm_users_0")])
+    rows.append([InlineKeyboardButton(text="🤖 AI provayderlar", callback_data="adm_ai_menu")])
     rows.append([InlineKeyboardButton(text="💾 Zaxira olish (qo'lda)", callback_data="adm_backup_now")])
 
     # TEST REJIMI: yoniq bo'lsa kanalga/foydalanuvchilarga HECH NARSA
@@ -512,14 +520,11 @@ async def adm_view_answer(call: CallbackQuery):
 # ==================================================================
 
 async def call_groq_vision(image_url: str, words: list[str]) -> dict | None:
-    """Groq vision modeliga rasm + so'zlar ro'yxatini yuborib, qaysi so'zlar
-    rasmga chindan ham aloqador (to'g'ri) va qaysilari emas (noto'g'ri)
-    ekanini so'raydi. Bir nechta API kalit bo'lsa, birinchisi ishlamasa
-    (limit/xatolik) navbatdagisiga o'tadi."""
-    if not config.GROQ_API_KEYS:
-        logger.warning("GROQ_API_KEYS sozlanmagan - 'Rasmga oidlik' AI baholovi o'tkazib yuboriladi.")
-        return None
-
+    """Rasm + so'zlar ro'yxatini AI'ga yuborib, qaysi so'zlar rasmga chindan
+    ham aloqador (to'g'ri) va qaysilari emas (noto'g'ri) ekanini so'raydi.
+    Ism eski qolgan (call_groq_vision) - lekin endi ai_providers.generate()
+    orqali DB'da sozlangan BARCHA provayder/kalitlarni sinab ko'radi (faqat
+    Groq emas), biri ishlamasa avtomatik navbatdagisiga o'tadi."""
     system_prompt = (
         "Sen 'Zakovat' viktorinasining 'Rasmga oidlik' raundida hakamsan. "
         "Senga bitta rasm va ishtirokchi yozgan so'z/ibora ro'yxati beriladi. "
@@ -531,48 +536,19 @@ async def call_groq_vision(image_url: str, words: list[str]) -> dict | None:
     )
     user_text = "Ishtirokchi yuborgan so'zlar (vergul bilan ajratilgan):\n" + ", ".join(words)
 
-    body = {
-        "model": config.GROQ_MODEL,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": user_text},
-                    {"type": "image_url", "image_url": {"url": image_url}},
-                ],
-            },
-        ],
-        "temperature": 0.2,
-        "max_completion_tokens": 600,
-        "response_format": {"type": "json_object"},
-    }
-
-    for key in config.GROQ_API_KEYS:
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    config.GROQ_API_URL,
-                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                    json=body,
-                    timeout=aiohttp.ClientTimeout(total=40),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        content = data["choices"][0]["message"]["content"]
-                        parsed = json.loads(content)
-                        correct = [str(x) for x in parsed.get("correct", [])]
-                        incorrect = [str(x) for x in parsed.get("incorrect", [])]
-                        return {"correct": correct, "incorrect": incorrect}
-                    else:
-                        err_text = await resp.text()
-                        logger.warning(f"Groq kalitida xatolik ({resp.status}): {err_text[:300]}")
-        except Exception as e:
-            logger.warning(f"Groq so'rovida xatolik: {e}")
-        # shu kalit ishlamadi -> ro'yxatdagi keyingi kalitga o'tamiz
-
-    logger.error("Barcha GROQ_API_KEYS urinishlari muvaffaqiyatsiz tugadi.")
-    return None
+    content = await ai_providers.generate(
+        prompt=user_text, system=system_prompt, image_data_url=image_url, json_mode=True,
+    )
+    if content is None:
+        return None
+    try:
+        parsed = json.loads(content)
+        correct = [str(x) for x in parsed.get("correct", [])]
+        incorrect = [str(x) for x in parsed.get("incorrect", [])]
+        return {"correct": correct, "incorrect": incorrect}
+    except Exception as e:
+        logger.error(f"AI javobini JSON sifatida o'qib bo'lmadi: {e} | javob: {content[:300]}")
+        return None
 
 
 async def score_assoc_answer(answer_id: int, image_file_id: str, words: list[str], user, image_number: int) -> None:
@@ -1096,6 +1072,126 @@ async def adm_msguser_send(message: Message, state: FSMContext):
     except Exception as e:
         logger.error(f"Foydalanuvchiga xabar yuborishda xatolik: {e}")
         await message.answer("❌ Xabar yuborilmadi (ehtimol foydalanuvchi botni bloklagan yoki hech qachon /start bosmagan).")
+
+
+# ==================================================================
+#  ADMIN: AI PROVAYDERLAR (kalitlarni /admin panelidan boshqarish)
+# ==================================================================
+
+async def _ai_menu_text_and_kb():
+    keys = await db.get_all_ai_keys()
+    lines = ["🤖 <b>AI provayderlar</b>\n"]
+    rows = []
+    if not keys:
+        lines.append("Hozircha hech qanday kalit qo'shilmagan.")
+    else:
+        for k in keys:
+            label = ai_providers.PROVIDERS.get(k["provider"], {}).get("label", k["provider"])
+            status = "🟢" if k["enabled"] else "🔴"
+            nick = f" — {html.escape(k['label'])}" if k["label"] else ""
+            lines.append(f"{status} <b>{label}</b> #{k['id']} ({ai_providers.mask_key(k['api_key'])}){nick}")
+            rows.append([
+                InlineKeyboardButton(
+                    text=f"{status} {label} #{k['id']}", callback_data=f"adm_ai_toggle_{k['id']}"
+                ),
+                InlineKeyboardButton(text="🗑", callback_data=f"adm_ai_del_{k['id']}"),
+            ])
+    rows.append([InlineKeyboardButton(text="➕ Kalit qo'shish", callback_data="adm_ai_addkey_menu")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_ai_menu")
+async def adm_ai_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    text, kb = await _ai_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_ai_addkey_menu")
+async def adm_ai_addkey_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    rows = [
+        [InlineKeyboardButton(text=cfg["label"], callback_data=f"adm_ai_addkey_{pid}")]
+        for pid, cfg in ai_providers.PROVIDERS.items()
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_ai_menu")])
+    await call.message.edit_text(
+        "🤖 <b>Qaysi provayder uchun kalit qo'shmoqchisiz?</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_ai_addkey_"))
+async def adm_ai_addkey_provider(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    provider = call.data.removeprefix("adm_ai_addkey_")
+    if provider not in ai_providers.PROVIDERS:
+        return await call.answer("Noma'lum provayder.", show_alert=True)
+
+    await state.update_data(pending_provider=provider)
+    await state.set_state(AdminAIKeyStates.waiting_key)
+    label = ai_providers.PROVIDERS[provider]["label"]
+    await call.message.edit_text(
+        f"🔑 <b>{label}</b> uchun API kalitini yuboring.\n\n"
+        "⚠️ Xabaringiz o'qilgach DARHOL o'chiriladi (chatda tokenning izi qolmasligi uchun)."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminAIKeyStates.waiting_key), F.text)
+async def adm_ai_key_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    provider = data.get("pending_provider")
+    await state.clear()
+
+    api_key = message.text.strip()
+    # XAVFSIZLIK: kalit chatda qolib ketmasligi uchun admin xabarini darhol o'chiramiz.
+    try:
+        await message.delete()
+    except Exception as e:
+        logger.warning(f"Admin kalit xabarini o'chirib bo'lmadi: {e}")
+
+    if not provider or provider not in ai_providers.PROVIDERS or not api_key:
+        await message.answer("❗️ Xatolik yuz berdi, qaytadan /admin > 🤖 AI provayderlar orqali urinib ko'ring.")
+        return
+
+    key_id = await db.add_ai_key(provider, api_key)
+    label = ai_providers.PROVIDERS[provider]["label"]
+    text, kb = await _ai_menu_text_and_kb()
+    await message.answer(
+        f"✅ {label} kaliti qo'shildi (#{key_id}, {ai_providers.mask_key(api_key)}).\n\n{text}",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("adm_ai_toggle_"))
+async def adm_ai_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    key_id = int(call.data.removeprefix("adm_ai_toggle_"))
+    await db.toggle_ai_key(key_id)
+    text, kb = await _ai_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_ai_del_"))
+async def adm_ai_delete(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    key_id = int(call.data.removeprefix("adm_ai_del_"))
+    await db.delete_ai_key(key_id)
+    text, kb = await _ai_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer("🗑 O'chirildi.")
 
 
 # ==================================================================

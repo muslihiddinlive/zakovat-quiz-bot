@@ -90,6 +90,37 @@ async def init_db() -> None:
             )
             """
         )
+        # AI provayder kalitlari (Groq/OpenAI/Gemini) - endi Render env
+        # o'rniga to'g'ridan-to'g'ri /admin panelidan qo'shiladi/o'chiriladi,
+        # botni qayta ishga tushirmasdan darhol kuchga kiradi.
+        await _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_keys (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider   TEXT NOT NULL,      -- 'groq' / 'openai' / 'gemini'
+                api_key    TEXT NOT NULL,
+                label      TEXT,
+                enabled    INTEGER DEFAULT 1,
+                added_at   TEXT
+            )
+            """
+        )
+        # AI avtomatik faoliyat qoidalari (2 va 3-qism: rejalashtirilgan
+        # postlar + guruh/kanal faolligi). Har bir qoida JSON konfiguratsiya
+        # sifatida saqlanadi - moslashuvchan tuzilma, yangi maydon qo'shish
+        # uchun migratsiya kerak bo'lmaydi.
+        await _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_rules (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                rule_type  TEXT NOT NULL,      -- 'scheduled_post' / 'group_activity' / 'auto_comment'
+                config     TEXT NOT NULL,      -- JSON
+                enabled    INTEGER DEFAULT 1,
+                created_at TEXT,
+                last_run_at TEXT
+            )
+            """
+        )
 
         # ----- Eski bazalarni yangi ustunlar bilan to'ldirish (migratsiya) -----
         await _add_column_if_missing("answers", "tournament_id", "INTEGER")
@@ -463,4 +494,92 @@ async def clear_assoc_images(tournament_id: int, round_num: int) -> None:
             "DELETE FROM assoc_images WHERE tournament_id = ? AND round_num = ?",
             (tournament_id, round_num),
         )
+        await _conn.commit()
+
+
+# ------------------------- AI KALITLARI -------------------------
+
+async def add_ai_key(provider: str, api_key: str, label: str | None = None) -> int:
+    async with _lock:
+        cur = await _conn.execute(
+            "INSERT INTO ai_keys (provider, api_key, label, enabled, added_at) VALUES (?, ?, ?, 1, ?)",
+            (provider, api_key, label, datetime.now().isoformat(timespec="seconds")),
+        )
+        await _conn.commit()
+        return cur.lastrowid
+
+
+async def get_all_ai_keys():
+    """Admin panelda ro'yxat ko'rsatish uchun - yoqilgan/o'chirilgan barchasi."""
+    async with _lock:
+        cur = await _conn.execute("SELECT * FROM ai_keys ORDER BY provider, id")
+        return await cur.fetchall()
+
+
+async def get_enabled_ai_keys():
+    """AI chaqiruvida foydalanish uchun - faqat yoqilganlar."""
+    async with _lock:
+        cur = await _conn.execute("SELECT * FROM ai_keys WHERE enabled = 1 ORDER BY provider, id")
+        return await cur.fetchall()
+
+
+async def toggle_ai_key(key_id: int) -> None:
+    async with _lock:
+        await _conn.execute("UPDATE ai_keys SET enabled = 1 - enabled WHERE id = ?", (key_id,))
+        await _conn.commit()
+
+
+async def delete_ai_key(key_id: int) -> None:
+    async with _lock:
+        await _conn.execute("DELETE FROM ai_keys WHERE id = ?", (key_id,))
+        await _conn.commit()
+
+
+# ------------------------- AI QOIDALARI (rejalashtirilgan post / guruh faolligi) -------------------------
+
+async def add_ai_rule(rule_type: str, config_json: str) -> int:
+    async with _lock:
+        cur = await _conn.execute(
+            "INSERT INTO ai_rules (rule_type, config, enabled, created_at) VALUES (?, ?, 1, ?)",
+            (rule_type, config_json, datetime.now().isoformat(timespec="seconds")),
+        )
+        await _conn.commit()
+        return cur.lastrowid
+
+
+async def get_all_ai_rules(rule_type: str | None = None):
+    async with _lock:
+        if rule_type:
+            cur = await _conn.execute("SELECT * FROM ai_rules WHERE rule_type = ? ORDER BY id", (rule_type,))
+        else:
+            cur = await _conn.execute("SELECT * FROM ai_rules ORDER BY rule_type, id")
+        return await cur.fetchall()
+
+
+async def get_enabled_ai_rules(rule_type: str | None = None):
+    async with _lock:
+        if rule_type:
+            cur = await _conn.execute(
+                "SELECT * FROM ai_rules WHERE rule_type = ? AND enabled = 1 ORDER BY id", (rule_type,)
+            )
+        else:
+            cur = await _conn.execute("SELECT * FROM ai_rules WHERE enabled = 1 ORDER BY rule_type, id")
+        return await cur.fetchall()
+
+
+async def toggle_ai_rule(rule_id: int) -> None:
+    async with _lock:
+        await _conn.execute("UPDATE ai_rules SET enabled = 1 - enabled WHERE id = ?", (rule_id,))
+        await _conn.commit()
+
+
+async def delete_ai_rule(rule_id: int) -> None:
+    async with _lock:
+        await _conn.execute("DELETE FROM ai_rules WHERE id = ?", (rule_id,))
+        await _conn.commit()
+
+
+async def update_ai_rule_last_run(rule_id: int, when: str) -> None:
+    async with _lock:
+        await _conn.execute("UPDATE ai_rules SET last_run_at = ? WHERE id = ?", (when, rule_id))
         await _conn.commit()
