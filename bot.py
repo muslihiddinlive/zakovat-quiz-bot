@@ -100,8 +100,10 @@ class AdminAIKeyStates(StatesGroup):
 
 class AdminSchedPostStates(StatesGroup):
     """Rejalashtirilgan (avtomatik) post yaratish: vaqt -> kunlar (tugma) ->
-    kontent turi (tugma) -> nishon (tugma) -> AI uchun promt (matn)."""
+    kontent turi (tugma) -> [agar matn bo'lmasa: media faylni yuborish] ->
+    nishon (tugma) -> AI uchun promt/tarif ko'rsatmasi (matn)."""
     waiting_time = State()
+    waiting_media = State()
     waiting_prompt = State()
 
 
@@ -1264,31 +1266,25 @@ async def adm_ai_delete(call: CallbackQuery):
 # ==================================================================
 
 DAYS_LABELS = {"daily": "Har kuni", "weekdays": "Ish kunlari (Dush-Jum)", "weekend": "Dam olish (Shan-Yak)"}
-CTYPE_LABELS = {"text": "📝 Matn", "photo": "🖼 Rasm (AI)"}
+CTYPE_LABELS = {
+    "text": "📝 Faqat matn (AI yozadi)",
+    "photo": "🖼 Rasm (o'zim yuboraman)",
+    "video": "🎬 Video (o'zim yuboraman)",
+    "audio": "🎵 Audio (o'zim yuboraman)",
+}
 TARGET_LABELS = {"channel": "📢 Kanal", "group": "👥 Guruh"}
 
 
-async def _generate_pollinations_image(prompt: str) -> bytes | None:
-    """Bepul, API-kalitsiz rasm generatsiyasi (image.pollinations.ai).
-    Rejalashtirilgan 'rasm' turidagi postlar uchun ishlatiladi."""
-    import urllib.parse
-    url = config.POLLINATIONS_IMAGE_URL.format(prompt=urllib.parse.quote(prompt))
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
-                if resp.status == 200:
-                    return await resp.read()
-                logger.warning(f"Pollinations rasm generatsiyasida xatolik: {resp.status}")
-    except Exception as e:
-        logger.warning(f"Pollinations so'rovida tarmoq xatoligi: {e}")
-    return None
-
-
 async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
+    """Rejalashtirilgan post ishga tushganda chaqiriladi. Matn - to'liq AI
+    tomonidan yoziladi. Rasm/video/audio - admin OLDINDAN yuborgan haqiqiy
+    faylni (file_id orqali) joylaydi, faqat tarif matnini AI yozadi -
+    AI hech qachon media generatsiya qilmaydi, faqat admin yuborgan faylni tarqatadi."""
     persona = await db.get_ai_persona()
     prompt = cfg.get("prompt", "")
     target = cfg.get("target", "channel")
     ctype = cfg.get("content", "text")
+    media_file_id = cfg.get("media_file_id")
 
     if target == "group":
         chat_id = await db.get_ai_group_chat_id()
@@ -1304,22 +1300,23 @@ async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
         return
 
     if await db.is_test_mode():
-        await send_test_mode_notice(f"🧪 <b>[TEST] Rejalashtirilgan post ketishi kerak edi</b> (#{rule_id}):\n\n{caption}")
+        await send_test_mode_notice(
+            f"🧪 <b>[TEST] Rejalashtirilgan post ketishi kerak edi</b> (#{rule_id}, {ctype}):\n\n{caption}"
+        )
         return
 
-    if ctype == "photo":
-        image_bytes = await _generate_pollinations_image(prompt)
-        if image_bytes:
-            try:
-                await bot.send_photo(chat_id, BufferedInputFile(image_bytes, filename="ai_post.jpg"), caption=caption)
-                return
-            except Exception as e:
-                logger.error(f"Rejalashtirilgan rasm postini yuborishda xatolik: {e}")
-        # Rasm ishlamay qolsa - hech bo'lmasa matnni yuboramiz (sukut bo'lib qolmasin).
     try:
-        await bot.send_message(chat_id, caption)
+        if ctype == "photo" and media_file_id:
+            await bot.send_photo(chat_id, media_file_id, caption=caption)
+        elif ctype == "video" and media_file_id:
+            await bot.send_video(chat_id, media_file_id, caption=caption)
+        elif ctype == "audio" and media_file_id:
+            await bot.send_audio(chat_id, media_file_id, caption=caption)
+        else:
+            await bot.send_message(chat_id, caption)
     except Exception as e:
         logger.error(f"Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
+
 
 
 async def _run_scheduled_posts() -> None:
@@ -1608,10 +1605,53 @@ async def adm_schedpost_ctype(call: CallbackQuery, state: FSMContext):
         return await call.answer("⛔️", show_alert=True)
     ctype = call.data.removeprefix("adm_schedpost_ctype_")
     await state.update_data(sp_ctype=ctype)
+
+    if ctype == "text":
+        # Matnli post uchun fayl kerak emas - to'g'ridan-to'g'ri nishonni so'raymiz.
+        rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_schedpost_target_{code}")]
+                for code, label in TARGET_LABELS.items()]
+        await call.message.edit_text("🎯 Qayerga yuborilsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+        await call.answer()
+        return
+
+    await state.set_state(AdminSchedPostStates.waiting_media)
+    kind_label = {"photo": "rasm", "video": "video", "audio": "audio"}.get(ctype, "fayl")
+    await call.message.edit_text(
+        f"📎 Kanalga/guruhga yuboriladigan haqiqiy {kind_label}ni shu yerga yuboring "
+        "(AI hech narsa generatsiya qilmaydi - siz yuborgan fayl aynan shu ko'rinishda joylanadi, "
+        "faqat tarif matnini AI yozadi)."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminSchedPostStates.waiting_media), F.photo | F.video | F.audio)
+async def adm_schedpost_media_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    expected = data.get("sp_ctype")
+
+    if expected == "photo" and message.photo:
+        file_id = message.photo[-1].file_id
+    elif expected == "video" and message.video:
+        file_id = message.video.file_id
+    elif expected == "audio" and message.audio:
+        file_id = message.audio.file_id
+    else:
+        await message.answer(f"❗️ Siz «{CTYPE_LABELS.get(expected, '?')}» turini tanlagansiz, shunga mos fayl yuboring.")
+        return
+
+    await state.update_data(sp_media_file_id=file_id)
     rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_schedpost_target_{code}")]
             for code, label in TARGET_LABELS.items()]
-    await call.message.edit_text("🎯 Qayerga yuborilsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
-    await call.answer()
+    await message.answer("✅ Fayl qabul qilindi.\n\n🎯 Qayerga yuborilsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.message(StateFilter(AdminSchedPostStates.waiting_media))
+async def adm_schedpost_media_wrong_type(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    await message.answer("❗️ Bu fayl turi mos emas. Rasm/video/audio sifatida (fayl/hujjat emas) yuboring.")
 
 
 @dp.callback_query(F.data.startswith("adm_schedpost_target_"))
@@ -1624,7 +1664,7 @@ async def adm_schedpost_target(call: CallbackQuery, state: FSMContext):
     await state.update_data(sp_target=target)
     await state.set_state(AdminSchedPostStates.waiting_prompt)
     await call.message.edit_text(
-        "✍️ AI uchun promt/ko'rsatma yozing.\n\n"
+        "✍️ Tarif/matn uchun AI'ga ko'rsatma yozing.\n\n"
         "Masalan: <i>\"Kunning qiziqarli faktini yoz\"</i> yoki "
         "<i>\"Bugungi turnir haqida qisqa reklama matni yoz\"</i>."
     )
@@ -1644,6 +1684,8 @@ async def adm_schedpost_prompt_received(message: Message, state: FSMContext):
         "target": data.get("sp_target", "channel"),
         "prompt": message.text.strip(),
     }
+    if data.get("sp_media_file_id"):
+        cfg["media_file_id"] = data["sp_media_file_id"]
     rule_id = await db.add_ai_rule("scheduled_post", json.dumps(cfg, ensure_ascii=False))
     text, kb = await _schedposts_menu_text_and_kb()
     await message.answer(f"✅ Rejalashtirilgan post qo'shildi (#{rule_id}).\n\n{text}", reply_markup=kb)

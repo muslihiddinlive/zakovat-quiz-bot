@@ -62,12 +62,6 @@ GROQ_MODEL = "qwen/qwen3.6-27b"  # Groq'dagi joriy vision (rasm+matn) modeli
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # ------------------------------------------------------------
-# RASM GENERATSIYASI (rejalashtirilgan "rasm" postlari uchun)
-# API kalit talab qilmaydi (bepul, ochiq endpoint).
-# ------------------------------------------------------------
-POLLINATIONS_IMAGE_URL = "https://image.pollinations.ai/prompt/{prompt}"
-
-# ------------------------------------------------------------
 # TURNIRLAR
 # ------------------------------------------------------------
 # Har bir turnir o'z raundlar to'plamiga ega. Raund raqamlari faqat
