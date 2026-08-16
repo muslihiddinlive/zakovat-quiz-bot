@@ -1275,6 +1275,17 @@ CTYPE_LABELS = {
 TARGET_LABELS = {"channel": "📢 Kanal", "group": "👥 Guruh"}
 
 
+async def _notify_admins(text: str) -> None:
+    """AI avtomatlashtirish xatoliklarini adminlarga yetkazish uchun - avval
+    bu xatoliklar faqat logga yozilib, jim ketardi va admin sabab
+    tushunmasdan qolardi (masalan AI kaliti sozlanmagani)."""
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text)
+        except Exception as e:
+            logger.warning(f"Adminga ({admin_id}) xatolik xabarini yuborib bo'lmadi: {e}")
+
+
 async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
     """Rejalashtirilgan post ishga tushganda chaqiriladi. Matn - to'liq AI
     tomonidan yoziladi. Rasm/video/audio - admin OLDINDAN yuborgan haqiqiy
@@ -1290,13 +1301,29 @@ async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
         chat_id = await db.get_ai_group_chat_id()
         if not chat_id:
             logger.warning(f"Rejalashtirilgan post #{rule_id}: guruh ID sozlanmagan, o'tkazib yuborildi.")
+            await _notify_admins(
+                f"⚠️ Rejalashtirilgan post #{rule_id} ishga tushmadi: guruh ID sozlanmagan.\n"
+                "/admin > 🤖 AI provayderlar > ⚙️ Avtomatlashtirish > 🎯 Guruh ID sozlash orqali kiriting."
+            )
             return
     else:
         chat_id = config.CHANNEL_ID
 
+    if not await ai_providers.has_any_key():
+        logger.warning(f"Rejalashtirilgan post #{rule_id}: hech qanday AI kaliti sozlanmagan.")
+        await _notify_admins(
+            f"⚠️ Rejalashtirilgan post #{rule_id} ishga tushmadi: AI kaliti sozlanmagan.\n"
+            "/admin > 🤖 AI provayderlar > ➕ Kalit qo'shish orqali kamida bitta kalit qo'shing."
+        )
+        return
+
     caption = await ai_providers.generate(prompt=prompt, system=persona)
     if caption is None:
-        logger.warning(f"Rejalashtirilgan post #{rule_id}: AI matn generatsiya qila olmadi (kalit sozlanganmi?).")
+        logger.warning(f"Rejalashtirilgan post #{rule_id}: AI matn generatsiya qila olmadi.")
+        await _notify_admins(
+            f"⚠️ Rejalashtirilgan post #{rule_id} ishga tushmadi: AI so'rovi muvaffaqiyatsiz tugadi "
+            "(barcha kalit/provayderlar javob bermadi - kalit noto'g'ri yoki limit tugagan bo'lishi mumkin)."
+        )
         return
 
     if await db.is_test_mode():
@@ -1316,7 +1343,7 @@ async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
             await bot.send_message(chat_id, caption)
     except Exception as e:
         logger.error(f"Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
-
+        await _notify_admins(f"⚠️ Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
 
 
 async def _run_scheduled_posts() -> None:
@@ -1340,6 +1367,7 @@ async def _run_scheduled_posts() -> None:
             continue  # shu vaqt oralig'ida bugun allaqachon ishga tushgan
         await _fire_scheduled_post(rule["id"], cfg)
         await db.update_ai_rule_last_run(rule["id"], now.isoformat(timespec="seconds"))
+
 
 
 async def _run_group_topics() -> None:
@@ -1526,6 +1554,7 @@ async def _schedposts_menu_text_and_kb():
         lines.append(f"{status} #{rule['id']}: {summary}")
         rows.append([
             InlineKeyboardButton(text=f"{status} #{rule['id']}", callback_data=f"adm_schedpost_toggle_{rule['id']}"),
+            InlineKeyboardButton(text="▶️ Hozir sinash", callback_data=f"adm_schedpost_test_{rule['id']}"),
             InlineKeyboardButton(text="🗑", callback_data=f"adm_schedpost_del_{rule['id']}"),
         ])
     rows.append([InlineKeyboardButton(text="➕ Yangi post qo'shish", callback_data="adm_schedpost_add")])
@@ -1552,6 +1581,30 @@ async def adm_schedpost_toggle(call: CallbackQuery):
     await call.answer()
 
 
+@dp.callback_query(F.data.startswith("adm_schedpost_test_"))
+async def adm_schedpost_test(call: CallbackQuery):
+    """Vaqt/kunni kutmasdan, qoidani DARHOL bir marta ishga tushiradi -
+    sozlamalar (AI kalit, guruh ID va h.k.) to'g'ri ishlayotganini tez
+    tekshirish uchun. last_run_at'ga TA'SIR QILMAYDI - rejadagi asl vaqt
+    o'zgarmaydi."""
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    rule_id = int(call.data.removeprefix("adm_schedpost_test_"))
+    rules = await db.get_all_ai_rules("scheduled_post")
+    rule = next((r for r in rules if r["id"] == rule_id), None)
+    if not rule:
+        return await call.answer("Topilmadi.", show_alert=True)
+    try:
+        cfg = json.loads(rule["config"])
+    except Exception:
+        return await call.answer("❗️ Qoida konfiguratsiyasi buzilgan.", show_alert=True)
+    await call.answer("⏳ Sinovdan o'tkazilyapti...")
+    await _fire_scheduled_post(rule_id, cfg)
+    await call.message.answer(
+        "✅ Sinov yakunlandi. Agar hech narsa kelmagan bo'lsa - adminlarga xatolik sababi haqida xabar ketgan bo'lishi kerak (yuqoriga qarang)."
+    )
+
+
 @dp.callback_query(F.data.startswith("adm_schedpost_del_"))
 async def adm_schedpost_del(call: CallbackQuery):
     if not is_admin(call.from_user.id):
@@ -1560,6 +1613,8 @@ async def adm_schedpost_del(call: CallbackQuery):
     text, kb = await _schedposts_menu_text_and_kb()
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer("🗑 O'chirildi.")
+
+
 
 
 @dp.callback_query(F.data == "adm_schedpost_add")
