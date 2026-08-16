@@ -22,6 +22,12 @@ DB_PATH = "zakovat_quiz.db"
 _conn: aiosqlite.Connection | None = None
 _lock = asyncio.Lock()
 
+DEFAULT_AI_PERSONA = (
+    "Sen 'Zakovat Quiz' turnirining guruh/kanalidagi do'stona AI yordamchisisan. "
+    "Ishtirokchilar bilan samimiy, hazilkash, lekin hurmatli ohangda, o'zbek tilida "
+    "gaplash. Javoblaring qisqa (1-3 gap) va tabiiy bo'lsin, o'rinli joyda emoji ishlat."
+)
+
 
 async def _add_column_if_missing(table: str, column: str, coltype: str) -> None:
     """Eski bazalarni yangi ustunlar bilan xavfsiz (ma'lumot yo'qotmasdan)
@@ -166,6 +172,28 @@ async def init_db() -> None:
         # ketmaydi, faqat admin(lar)ga simulyatsiya ko'rinishida yuboriladi.
         await _conn.execute(
             "INSERT OR IGNORE INTO settings (key, value) VALUES ('test_mode', '0')"
+        )
+        # ai_group_chat_id: AI guruh faolligi (avtomatik izoh, mavzu ochish,
+        # foydalanuvchilarga javob berish) ishlaydigan guruh/muhokama chat ID.
+        # 0 = sozlanmagan.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_group_chat_id', '0')"
+        )
+        # ai_auto_comment_enabled: 1 bo'lsa, kanalga yangi post/raund
+        # e'lon qilinganda AI avtomatik ravishda guruhga qisqa izoh yozadi.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_auto_comment_enabled', '0')"
+        )
+        # ai_group_activity_enabled: 1 bo'lsa, AI foydalanuvchilarning
+        # xabarlariga (mention/reply qilinganda) guruhda javob qaytaradi.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_group_activity_enabled', '0')"
+        )
+        # ai_persona: AI'ning guruh/kanaldagi "xarakteri" - barcha avtomatik
+        # generatsiyalarda system prompt sifatida ishlatiladi.
+        await _conn.execute(
+            "INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_persona', ?)",
+            (DEFAULT_AI_PERSONA,),
         )
         await _conn.commit()
 
@@ -425,6 +453,49 @@ async def is_test_mode() -> bool:
 
 async def set_test_mode(active: bool) -> None:
     await set_setting("test_mode", "1" if active else "0")
+
+
+# ------------------------- AI GURUH/KANAL FAOLLIGI SOZLAMALARI -------------------------
+
+async def get_ai_group_chat_id() -> int:
+    """AI avtomatik izoh/mavzu ochish/javob berish ishlaydigan guruh ID'si. 0 = sozlanmagan."""
+    val = await get_setting("ai_group_chat_id")
+    try:
+        return int(val) if val else 0
+    except ValueError:
+        return 0
+
+
+async def set_ai_group_chat_id(chat_id: int) -> None:
+    await set_setting("ai_group_chat_id", str(chat_id))
+
+
+async def is_ai_auto_comment_enabled() -> bool:
+    val = await get_setting("ai_auto_comment_enabled")
+    return val == "1"
+
+
+async def set_ai_auto_comment_enabled(active: bool) -> None:
+    await set_setting("ai_auto_comment_enabled", "1" if active else "0")
+
+
+async def is_ai_group_activity_enabled() -> bool:
+    """Yoniq bo'lsa: AI foydalanuvchilar mention/reply qilganda guruhda javob beradi."""
+    val = await get_setting("ai_group_activity_enabled")
+    return val == "1"
+
+
+async def set_ai_group_activity_enabled(active: bool) -> None:
+    await set_setting("ai_group_activity_enabled", "1" if active else "0")
+
+
+async def get_ai_persona() -> str:
+    val = await get_setting("ai_persona")
+    return val or DEFAULT_AI_PERSONA
+
+
+async def set_ai_persona(text: str) -> None:
+    await set_setting("ai_persona", text)
 
 
 async def clear_answers() -> None:

@@ -54,6 +54,15 @@ logger = logging.getLogger(__name__)
 bot = Bot(token=config.BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
+# main() ichida bot.get_me() orqali to'ldiriladi - guruhda "@bot_username"
+# ko'rinishidagi mention'larni aniqlash uchun kerak.
+BOT_USERNAME: str | None = None
+
+# Guruhda AI javob berish uchun flood/AI-kvota himoyasi: bir chatga
+# ketma-ket juda tez-tez javob yozib, kalitlarni "kuydirib" yubormaslik.
+_GROUP_REPLY_COOLDOWN_SEC = 15
+_group_reply_last: dict[int, float] = {}
+
 
 def get_rounds(tournament_id: int) -> dict:
     """Berilgan turnirning raundlar lug'atini qaytaradi (topilmasa - bo'sh)."""
@@ -87,6 +96,27 @@ class AdminAIKeyStates(StatesGroup):
     """AI provayder kaliti qo'shish: avval provayder tanlanadi (tugma orqali),
     so'ng shu holatda kalit matn sifatida kutiladi."""
     waiting_key = State()
+
+
+class AdminSchedPostStates(StatesGroup):
+    """Rejalashtirilgan (avtomatik) post yaratish: vaqt -> kunlar (tugma) ->
+    kontent turi (tugma) -> nishon (tugma) -> AI uchun promt (matn)."""
+    waiting_time = State()
+    waiting_prompt = State()
+
+
+class AdminGroupTopicStates(StatesGroup):
+    """Guruhda AI o'zi mavzu ochadigan qoida: intervalda (soat) -> promt matni."""
+    waiting_interval = State()
+    waiting_prompt = State()
+
+
+class AdminGroupChatIdStates(StatesGroup):
+    waiting_chat_id = State()
+
+
+class AdminPersonaStates(StatesGroup):
+    waiting_persona = State()
 
 
 # ==================================================================
@@ -201,6 +231,7 @@ async def post_text_to_channel(text: str) -> None:
         return
     try:
         await bot.send_message(config.CHANNEL_ID, text)
+        asyncio.create_task(_maybe_auto_comment(text))
     except Exception as e:
         logger.error(f"Kanalga xabar yuborishda xatolik: {e}")
 
@@ -219,8 +250,32 @@ async def post_sticker_to_channel(sticker_file_id: str, caption: str | None = No
         await bot.send_sticker(config.CHANNEL_ID, sticker=sticker_file_id)
         if caption:
             await bot.send_message(config.CHANNEL_ID, caption)
+            asyncio.create_task(_maybe_auto_comment(caption))
     except Exception as e:
         logger.error(f"Kanalga stiker yuborishda xatolik: {e}")
+
+
+async def _maybe_auto_comment(context_text: str) -> None:
+    """Kanalga yangi e'lon ketgach, agar 'Auto-izoh' yoniq bo'lsa, AI shu
+    e'lon haqida qisqa izoh yozib, sozlangan guruhga yuboradi. asyncio.create_task
+    orqali fon vazifasi sifatida chaqiriladi - kanal postini kechiktirmaslik uchun."""
+    try:
+        if not await db.is_ai_auto_comment_enabled() or await db.is_test_mode():
+            return
+        group_chat_id = await db.get_ai_group_chat_id()
+        if not group_chat_id:
+            return
+        persona = await db.get_ai_persona()
+        prompt = (
+            f"Hozirgina kanalga quyidagi e'lon qilindi:\n\n{context_text}\n\n"
+            "Shu haqida muhokama guruhidagi a'zolarni qiziqtiradigan, qisqa "
+            "(1-2 gap) tabiiy izoh/sharh yoz. Faqat izoh matnini yoz, boshqa hech narsa qo'shma."
+        )
+        comment = await ai_providers.generate(prompt=prompt, system=persona)
+        if comment:
+            await bot.send_message(group_chat_id, comment)
+    except Exception as e:
+        logger.error(f"Auto-izoh yuborishda xatolik: {e}")
 
 
 # ==================================================================
@@ -252,6 +307,14 @@ class SubscriptionMiddleware(BaseMiddleware):
     ) -> Any:
         user = data.get("event_from_user")
         if user is None:
+            return await handler(event, data)
+
+        # Majburiy obuna tekshiruvi FAQAT shaxsiy chatga tegishli (botning
+        # o'zi bilan bevosita muloqot). Guruh/kanal xabarlarida bu tekshiruv
+        # o'chirilgan - aks holda AI guruh faolligi yoqilganda, obuna
+        # bo'lmagan har bir a'zoning oddiy xabariga botning "obuna bo'ling"
+        # ogohlantirishi GURUHGA E'LON qilinib, spam bo'lib qolar edi.
+        if isinstance(event, Message) and event.chat.type != "private":
             return await handler(event, data)
 
         # "Obunani tekshirish" tugmasi har doim o'tishi kerak
@@ -1097,6 +1160,7 @@ async def _ai_menu_text_and_kb():
                 InlineKeyboardButton(text="🗑", callback_data=f"adm_ai_del_{k['id']}"),
             ])
     rows.append([InlineKeyboardButton(text="➕ Kalit qo'shish", callback_data="adm_ai_addkey_menu")])
+    rows.append([InlineKeyboardButton(text="⚙️ Avtomatlashtirish (post/guruh)", callback_data="adm_aiauto_menu")])
     rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -1192,6 +1256,532 @@ async def adm_ai_delete(call: CallbackQuery):
     text, kb = await _ai_menu_text_and_kb()
     await call.message.edit_text(text, reply_markup=kb)
     await call.answer("🗑 O'chirildi.")
+
+
+# ==================================================================
+#  AI AVTOMATLASHTIRISH: rejalashtirilgan postlar, guruh mavzu
+#  boshlovchisi, real-vaqt javob va sozlamalar (guruh ID, xarakter)
+# ==================================================================
+
+DAYS_LABELS = {"daily": "Har kuni", "weekdays": "Ish kunlari (Dush-Jum)", "weekend": "Dam olish (Shan-Yak)"}
+CTYPE_LABELS = {"text": "📝 Matn", "photo": "🖼 Rasm (AI)"}
+TARGET_LABELS = {"channel": "📢 Kanal", "group": "👥 Guruh"}
+
+
+async def _generate_pollinations_image(prompt: str) -> bytes | None:
+    """Bepul, API-kalitsiz rasm generatsiyasi (image.pollinations.ai).
+    Rejalashtirilgan 'rasm' turidagi postlar uchun ishlatiladi."""
+    import urllib.parse
+    url = config.POLLINATIONS_IMAGE_URL.format(prompt=urllib.parse.quote(prompt))
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=60)) as resp:
+                if resp.status == 200:
+                    return await resp.read()
+                logger.warning(f"Pollinations rasm generatsiyasida xatolik: {resp.status}")
+    except Exception as e:
+        logger.warning(f"Pollinations so'rovida tarmoq xatoligi: {e}")
+    return None
+
+
+async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
+    persona = await db.get_ai_persona()
+    prompt = cfg.get("prompt", "")
+    target = cfg.get("target", "channel")
+    ctype = cfg.get("content", "text")
+
+    if target == "group":
+        chat_id = await db.get_ai_group_chat_id()
+        if not chat_id:
+            logger.warning(f"Rejalashtirilgan post #{rule_id}: guruh ID sozlanmagan, o'tkazib yuborildi.")
+            return
+    else:
+        chat_id = config.CHANNEL_ID
+
+    caption = await ai_providers.generate(prompt=prompt, system=persona)
+    if caption is None:
+        logger.warning(f"Rejalashtirilgan post #{rule_id}: AI matn generatsiya qila olmadi (kalit sozlanganmi?).")
+        return
+
+    if await db.is_test_mode():
+        await send_test_mode_notice(f"🧪 <b>[TEST] Rejalashtirilgan post ketishi kerak edi</b> (#{rule_id}):\n\n{caption}")
+        return
+
+    if ctype == "photo":
+        image_bytes = await _generate_pollinations_image(prompt)
+        if image_bytes:
+            try:
+                await bot.send_photo(chat_id, BufferedInputFile(image_bytes, filename="ai_post.jpg"), caption=caption)
+                return
+            except Exception as e:
+                logger.error(f"Rejalashtirilgan rasm postini yuborishda xatolik: {e}")
+        # Rasm ishlamay qolsa - hech bo'lmasa matnni yuboramiz (sukut bo'lib qolmasin).
+    try:
+        await bot.send_message(chat_id, caption)
+    except Exception as e:
+        logger.error(f"Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
+
+
+async def _run_scheduled_posts() -> None:
+    now = datetime.now()
+    hhmm = now.strftime("%H:%M")
+    today_str = now.strftime("%Y-%m-%d")
+    for rule in await db.get_enabled_ai_rules("scheduled_post"):
+        try:
+            cfg = json.loads(rule["config"])
+        except Exception:
+            continue
+        if cfg.get("time") != hhmm:
+            continue
+        days_code = cfg.get("days", "daily")
+        if days_code == "weekdays" and now.weekday() not in (0, 1, 2, 3, 4):
+            continue
+        if days_code == "weekend" and now.weekday() not in (5, 6):
+            continue
+        last_run = rule["last_run_at"] or ""
+        if last_run.startswith(today_str):
+            continue  # shu vaqt oralig'ida bugun allaqachon ishga tushgan
+        await _fire_scheduled_post(rule["id"], cfg)
+        await db.update_ai_rule_last_run(rule["id"], now.isoformat(timespec="seconds"))
+
+
+async def _run_group_topics() -> None:
+    group_chat_id = await db.get_ai_group_chat_id()
+    if not group_chat_id:
+        return
+    now = datetime.now()
+    for rule in await db.get_enabled_ai_rules("group_topic"):
+        try:
+            cfg = json.loads(rule["config"])
+        except Exception:
+            continue
+        interval_hours = cfg.get("interval_hours", 6)
+        last_run = rule["last_run_at"]
+        if last_run:
+            try:
+                if (now - datetime.fromisoformat(last_run)).total_seconds() < interval_hours * 3600:
+                    continue
+            except Exception:
+                pass
+        persona = await db.get_ai_persona()
+        text = await ai_providers.generate(
+            prompt=cfg.get("prompt", "Guruhda ishtirokchilar bilan qiziqarli mavzu och."), system=persona
+        )
+        if not text:
+            continue
+        if await db.is_test_mode():
+            await send_test_mode_notice(f"🧪 <b>[TEST] Guruh mavzu boshlovchisi ketishi kerak edi:</b>\n\n{text}")
+        else:
+            try:
+                await bot.send_message(group_chat_id, text)
+            except Exception as e:
+                logger.error(f"Guruh mavzu boshlovchisini yuborishda xatolik: {e}")
+        await db.update_ai_rule_last_run(rule["id"], now.isoformat(timespec="seconds"))
+
+
+async def ai_scheduler_loop() -> None:
+    """Har daqiqada rejalashtirilgan postlar va guruh mavzu boshlovchisi
+    qoidalarini tekshiradi. periodic_backup_loop bilan bir xil naqshda -
+    xatolik butun loopni o'ldirmasligi uchun try/except ichida."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await _run_scheduled_posts()
+        except Exception as e:
+            logger.error(f"Rejalashtirilgan postlarni tekshirishda xatolik: {e}")
+        try:
+            await _run_group_topics()
+        except Exception as e:
+            logger.error(f"Guruh mavzu boshlovchisini tekshirishda xatolik: {e}")
+
+
+# ------------------------- ADMIN: AVTOMATLASHTIRISH MENYUSI -------------------------
+
+async def _aiauto_menu_text_and_kb():
+    group_id = await db.get_ai_group_chat_id()
+    group_activity = await db.is_ai_group_activity_enabled()
+    auto_comment = await db.is_ai_auto_comment_enabled()
+    realtime_label = "🟢 yoniq" if group_activity else "🔴 o'chiq"
+    autocomment_label = "🟢 yoniq" if auto_comment else "🔴 o'chiq"
+    text = (
+        "⚙️ <b>AI avtomatlashtirish</b>\n\n"
+        f"🎯 Guruh ID: <code>{group_id if group_id else 'sozlanmagan'}</code>\n"
+        f"🗣 Real-vaqt javob (mention/reply): {realtime_label}\n"
+        f"💬 Auto-izoh (yangi post): {autocomment_label}"
+    )
+    rows = [
+        [InlineKeyboardButton(text="📅 Rejalashtirilgan postlar", callback_data="adm_schedposts_menu")],
+        [InlineKeyboardButton(text="🗨 Guruh mavzu boshlovchisi", callback_data="adm_grouptopics_menu")],
+        [InlineKeyboardButton(
+            text=("🔴 Real-vaqt javobni o'chirish" if group_activity else "🟢 Real-vaqt javobni yoqish"),
+            callback_data="adm_toggle_groupactivity",
+        )],
+        [InlineKeyboardButton(
+            text=("🔴 Auto-izohni o'chirish" if auto_comment else "🟢 Auto-izohni yoqish"),
+            callback_data="adm_toggle_autocomment",
+        )],
+        [InlineKeyboardButton(text="🎯 Guruh ID sozlash", callback_data="adm_set_groupid")],
+        [InlineKeyboardButton(text="🎭 AI xarakterini sozlash", callback_data="adm_set_persona")],
+        [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_ai_menu")],
+    ]
+    return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_aiauto_menu")
+async def adm_aiauto_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    text, kb = await _aiauto_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_toggle_groupactivity")
+async def adm_toggle_groupactivity(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.set_ai_group_activity_enabled(not await db.is_ai_group_activity_enabled())
+    text, kb = await _aiauto_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_toggle_autocomment")
+async def adm_toggle_autocomment(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.set_ai_auto_comment_enabled(not await db.is_ai_auto_comment_enabled())
+    text, kb = await _aiauto_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_set_groupid")
+async def adm_set_groupid(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await state.set_state(AdminGroupChatIdStates.waiting_chat_id)
+    await call.message.edit_text(
+        "🎯 Guruh (muhokama chati) ID'sini yuboring.\n\n"
+        "Masalan: <code>-1001234567890</code>\n\n"
+        "💡 Bilmasangiz: botni shu guruhga admin qilib qo'shing, guruhda istalgan xabar yozing - "
+        "log/xatolik xabarlarida chat ID ko'rinadi, yoki @userinfobot kabi botlardan foydalaning."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminGroupChatIdStates.waiting_chat_id), F.text)
+async def adm_set_groupid_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    try:
+        chat_id = int(message.text.strip())
+    except ValueError:
+        await message.answer("❗️ Noto'g'ri format. Butun son bo'lishi kerak, masalan -1001234567890.")
+        return
+    await db.set_ai_group_chat_id(chat_id)
+    text, kb = await _aiauto_menu_text_and_kb()
+    await message.answer(f"✅ Guruh ID saqlandi: <code>{chat_id}</code>\n\n{text}", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "adm_set_persona")
+async def adm_set_persona(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    current = await db.get_ai_persona()
+    await state.set_state(AdminPersonaStates.waiting_persona)
+    await call.message.edit_text(
+        f"🎭 AI'ning hozirgi xarakteri (system prompt):\n\n<i>{html.escape(current)}</i>\n\n"
+        "Yangisini yozib yuboring (butun matnni almashtiradi):"
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminPersonaStates.waiting_persona), F.text)
+async def adm_set_persona_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    await db.set_ai_persona(message.text.strip())
+    text, kb = await _aiauto_menu_text_and_kb()
+    await message.answer(f"✅ AI xarakteri yangilandi.\n\n{text}", reply_markup=kb)
+
+
+# ------------------------- ADMIN: REJALASHTIRILGAN POSTLAR -------------------------
+
+async def _schedposts_menu_text_and_kb():
+    rules = await db.get_all_ai_rules("scheduled_post")
+    lines = ["📅 <b>Rejalashtirilgan postlar</b>\n"]
+    rows = []
+    if not rules:
+        lines.append("Hozircha hech qanday post rejalashtirilmagan.")
+    for rule in rules:
+        try:
+            cfg = json.loads(rule["config"])
+        except Exception:
+            cfg = {}
+        status = "🟢" if rule["enabled"] else "🔴"
+        summary = (
+            f"{cfg.get('time', '?')} | {DAYS_LABELS.get(cfg.get('days'), '?')} | "
+            f"{CTYPE_LABELS.get(cfg.get('content'), '?')} → {TARGET_LABELS.get(cfg.get('target'), '?')}"
+        )
+        lines.append(f"{status} #{rule['id']}: {summary}")
+        rows.append([
+            InlineKeyboardButton(text=f"{status} #{rule['id']}", callback_data=f"adm_schedpost_toggle_{rule['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"adm_schedpost_del_{rule['id']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Yangi post qo'shish", callback_data="adm_schedpost_add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_aiauto_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_schedposts_menu")
+async def adm_schedposts_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    text, kb = await _schedposts_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_schedpost_toggle_"))
+async def adm_schedpost_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.toggle_ai_rule(int(call.data.removeprefix("adm_schedpost_toggle_")))
+    text, kb = await _schedposts_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_schedpost_del_"))
+async def adm_schedpost_del(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.delete_ai_rule(int(call.data.removeprefix("adm_schedpost_del_")))
+    text, kb = await _schedposts_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer("🗑 O'chirildi.")
+
+
+@dp.callback_query(F.data == "adm_schedpost_add")
+async def adm_schedpost_add(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await state.set_state(AdminSchedPostStates.waiting_time)
+    await call.message.edit_text(
+        "🕒 Vaqtni kiriting (24 soatlik format, masalan <code>09:00</code>):"
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminSchedPostStates.waiting_time), F.text)
+async def adm_schedpost_time_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    time_str = message.text.strip()
+    if not re.match(r"^([01]\d|2[0-3]):[0-5]\d$", time_str):
+        await message.answer("❗️ Noto'g'ri format. Masalan: 09:00 yoki 21:30. Qaytadan kiriting:")
+        return
+    await state.update_data(sp_time=time_str)
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_schedpost_days_{code}")]
+            for code, label in DAYS_LABELS.items()]
+    await message.answer("📆 Qaysi kunlari yuborilsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+
+
+@dp.callback_query(F.data.startswith("adm_schedpost_days_"))
+async def adm_schedpost_days(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    days_code = call.data.removeprefix("adm_schedpost_days_")
+    await state.update_data(sp_days=days_code)
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_schedpost_ctype_{code}")]
+            for code, label in CTYPE_LABELS.items()]
+    await call.message.edit_text("🎨 Kontent turi qanday bo'lsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_schedpost_ctype_"))
+async def adm_schedpost_ctype(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    ctype = call.data.removeprefix("adm_schedpost_ctype_")
+    await state.update_data(sp_ctype=ctype)
+    rows = [[InlineKeyboardButton(text=label, callback_data=f"adm_schedpost_target_{code}")]
+            for code, label in TARGET_LABELS.items()]
+    await call.message.edit_text("🎯 Qayerga yuborilsin?", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_schedpost_target_"))
+async def adm_schedpost_target(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    target = call.data.removeprefix("adm_schedpost_target_")
+    if target == "group" and not await db.get_ai_group_chat_id():
+        return await call.answer("⚠️ Avval guruh ID'sini sozlang (⚙️ Avtomatlashtirish > 🎯 Guruh ID).", show_alert=True)
+    await state.update_data(sp_target=target)
+    await state.set_state(AdminSchedPostStates.waiting_prompt)
+    await call.message.edit_text(
+        "✍️ AI uchun promt/ko'rsatma yozing.\n\n"
+        "Masalan: <i>\"Kunning qiziqarli faktini yoz\"</i> yoki "
+        "<i>\"Bugungi turnir haqida qisqa reklama matni yoz\"</i>."
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminSchedPostStates.waiting_prompt), F.text)
+async def adm_schedpost_prompt_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    cfg = {
+        "time": data.get("sp_time"),
+        "days": data.get("sp_days", "daily"),
+        "content": data.get("sp_ctype", "text"),
+        "target": data.get("sp_target", "channel"),
+        "prompt": message.text.strip(),
+    }
+    rule_id = await db.add_ai_rule("scheduled_post", json.dumps(cfg, ensure_ascii=False))
+    text, kb = await _schedposts_menu_text_and_kb()
+    await message.answer(f"✅ Rejalashtirilgan post qo'shildi (#{rule_id}).\n\n{text}", reply_markup=kb)
+
+
+# ------------------------- ADMIN: GURUH MAVZU BOSHLOVCHISI -------------------------
+
+async def _grouptopics_menu_text_and_kb():
+    rules = await db.get_all_ai_rules("group_topic")
+    lines = ["🗨 <b>Guruh mavzu boshlovchisi</b>\n"]
+    rows = []
+    if not rules:
+        lines.append("Hozircha hech qanday qoida yo'q.")
+    for rule in rules:
+        try:
+            cfg = json.loads(rule["config"])
+        except Exception:
+            cfg = {}
+        status = "🟢" if rule["enabled"] else "🔴"
+        lines.append(f"{status} #{rule['id']}: har {cfg.get('interval_hours', '?')} soatda — {cfg.get('prompt', '')[:40]}")
+        rows.append([
+            InlineKeyboardButton(text=f"{status} #{rule['id']}", callback_data=f"adm_grouptopic_toggle_{rule['id']}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"adm_grouptopic_del_{rule['id']}"),
+        ])
+    rows.append([InlineKeyboardButton(text="➕ Yangi qoida qo'shish", callback_data="adm_grouptopic_add")])
+    rows.append([InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_aiauto_menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@dp.callback_query(F.data == "adm_grouptopics_menu")
+async def adm_grouptopics_menu(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    if not await db.get_ai_group_chat_id():
+        return await call.answer("⚠️ Avval guruh ID'sini sozlang (⚙️ Avtomatlashtirish > 🎯 Guruh ID).", show_alert=True)
+    text, kb = await _grouptopics_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_grouptopic_toggle_"))
+async def adm_grouptopic_toggle(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.toggle_ai_rule(int(call.data.removeprefix("adm_grouptopic_toggle_")))
+    text, kb = await _grouptopics_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("adm_grouptopic_del_"))
+async def adm_grouptopic_del(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await db.delete_ai_rule(int(call.data.removeprefix("adm_grouptopic_del_")))
+    text, kb = await _grouptopics_menu_text_and_kb()
+    await call.message.edit_text(text, reply_markup=kb)
+    await call.answer("🗑 O'chirildi.")
+
+
+@dp.callback_query(F.data == "adm_grouptopic_add")
+async def adm_grouptopic_add(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await state.set_state(AdminGroupTopicStates.waiting_interval)
+    await call.message.edit_text("⏱ Necha soatda bir marta mavzu ochilsin? (masalan: 6)")
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminGroupTopicStates.waiting_interval), F.text)
+async def adm_grouptopic_interval_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        hours = int(message.text.strip())
+        if hours < 1:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗️ Musbat butun son kiriting (masalan: 6).")
+        return
+    await state.update_data(gt_interval=hours)
+    await state.set_state(AdminGroupTopicStates.waiting_prompt)
+    await message.answer(
+        "✍️ AI uchun ko'rsatma yozing.\n\n"
+        "Masalan: <i>\"Ishtirokchilardan bugungi kayfiyati haqida so'ra\"</i> yoki "
+        "<i>\"Zakovat/bilim haqida qiziqarli savol ber\"</i>."
+    )
+
+
+@dp.message(StateFilter(AdminGroupTopicStates.waiting_prompt), F.text)
+async def adm_grouptopic_prompt_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    data = await state.get_data()
+    await state.clear()
+    cfg = {"interval_hours": data.get("gt_interval", 6), "prompt": message.text.strip()}
+    rule_id = await db.add_ai_rule("group_topic", json.dumps(cfg, ensure_ascii=False))
+    text, kb = await _grouptopics_menu_text_and_kb()
+    await message.answer(f"✅ Qoida qo'shildi (#{rule_id}).\n\n{text}", reply_markup=kb)
+
+
+# ------------------------- GURUHDA REAL-VAQT AI JAVOBI -------------------------
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+async def ai_group_realtime_reply(message: Message):
+    """Guruhda botga reply qilingan yoki @username orqali mention qilingan
+    xabarlarga AI javob beradi. Boshqa har qanday oddiy xabarga tegmaydi -
+    aks holda guruh AI-spam bo'lib qolar edi."""
+    if message.from_user and message.from_user.is_bot:
+        return  # boshqa botlar (yoki o'zimiz) bilan cheksiz sikl bo'lmasin
+    if not await db.is_ai_group_activity_enabled():
+        return
+    group_chat_id = await db.get_ai_group_chat_id()
+    if not group_chat_id or message.chat.id != group_chat_id:
+        return
+
+    mentioned = bool(BOT_USERNAME) and f"@{BOT_USERNAME.lower()}" in message.text.lower()
+    replied_to_bot = bool(
+        message.reply_to_message
+        and message.reply_to_message.from_user
+        and message.reply_to_message.from_user.id == bot.id
+    )
+    if not (mentioned or replied_to_bot):
+        return
+
+    now = time.monotonic()
+    last = _group_reply_last.get(message.chat.id, 0.0)
+    if now - last < _GROUP_REPLY_COOLDOWN_SEC:
+        return
+    _group_reply_last[message.chat.id] = now
+
+    persona = await db.get_ai_persona()
+    reply_text = await ai_providers.generate(prompt=message.text, system=persona)
+    if reply_text:
+        try:
+            await message.reply(reply_text)
+        except Exception as e:
+            logger.error(f"Guruhda AI javob yuborishda xatolik: {e}")
 
 
 # ==================================================================
@@ -1545,9 +2135,12 @@ async def periodic_backup_loop() -> None:
 
 
 async def main():
+    global BOT_USERNAME
     await restore_db_from_telegram()
     await db.init_db()
-    logger.info("Bot ishga tushdi...")
+    me = await bot.get_me()
+    BOT_USERNAME = me.username
+    logger.info(f"Bot ishga tushdi... (@{BOT_USERNAME})")
     try:
         await bot.delete_webhook(drop_pending_updates=True)
         # Render'ning bepul "Web Service" tarifi HTTP portni tinglashni talab
@@ -1560,6 +2153,7 @@ async def main():
             dp.start_polling(bot),
             run_health_server(),
             periodic_backup_loop(),
+            ai_scheduler_loop(),
         )
     finally:
         await backup_db_to_telegram()  # to'xtashdan oldin ham oxirgi holatni saqlab qolamiz
