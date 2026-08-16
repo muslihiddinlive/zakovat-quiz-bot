@@ -498,6 +498,17 @@ async def set_ai_persona(text: str) -> None:
     await set_setting("ai_persona", text)
 
 
+async def get_ai_general_rule() -> str:
+    """Persona'dan farqli - bu 'stil qoidasi' (masalan 'qisqaroq yoz, oxirida
+    @ParadoksHub deb qo'sh') va BARCHA AI generatsiyalariga (post, izoh,
+    guruh javoblari) qo'llaniladi. Bo'sh bo'lishi mumkin (ixtiyoriy)."""
+    return await get_setting("ai_general_rule") or ""
+
+
+async def set_ai_general_rule(text: str) -> None:
+    await set_setting("ai_general_rule", text)
+
+
 async def clear_answers() -> None:
     """Faqat javoblar tarixini tozalaydi (ro'yxatdan o'tganlar saqlanib qoladi)."""
     async with _lock:

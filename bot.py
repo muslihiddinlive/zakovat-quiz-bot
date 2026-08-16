@@ -101,10 +101,16 @@ class AdminAIKeyStates(StatesGroup):
 class AdminSchedPostStates(StatesGroup):
     """Rejalashtirilgan (avtomatik) post yaratish: vaqt -> kunlar (tugma) ->
     kontent turi (tugma) -> [agar matn bo'lmasa: media faylni yuborish] ->
-    nishon (tugma) -> AI uchun promt/tarif ko'rsatmasi (matn)."""
+    nishon (tugma) -> AI uchun promt/tarif ko'rsatmasi (matn) ->
+    [ixtiyoriy: shu post uchungina qo'shimcha qoida]."""
     waiting_time = State()
     waiting_media = State()
     waiting_prompt = State()
+    waiting_extra_rule = State()
+
+
+class AdminGeneralRuleStates(StatesGroup):
+    waiting_rule = State()
 
 
 class AdminGroupTopicStates(StatesGroup):
@@ -257,6 +263,22 @@ async def post_sticker_to_channel(sticker_file_id: str, caption: str | None = No
         logger.error(f"Kanalga stiker yuborishda xatolik: {e}")
 
 
+async def _build_ai_system(extra_rule: str | None = None) -> str:
+    """AI'ning barcha 'ijodiy' (post/izoh/guruh javobi) generatsiyalari uchun
+    system promptni yig'adi: xarakter (persona) + umumiy qoida (agar
+    sozlangan bo'lsa, masalan 'qisqaroq yoz, oxirida @ParadoksHub qo'sh') +
+    shu aniq post uchungina beriladigan qo'shimcha qoida (ixtiyoriy).
+    'Rasmga oidlik' AI-hakami (call_groq_vision) BUNDAN foydalanmaydi - u
+    qat'iy JSON formatli maxsus vazifa, persona bilan aralashmasligi kerak."""
+    parts = [await db.get_ai_persona()]
+    general_rule = await db.get_ai_general_rule()
+    if general_rule:
+        parts.append(f"Qo'shimcha umumiy qoida: {general_rule}")
+    if extra_rule:
+        parts.append(f"Shu post uchun maxsus qoida: {extra_rule}")
+    return "\n\n".join(p for p in parts if p)
+
+
 async def _maybe_auto_comment(context_text: str) -> None:
     """Kanalga yangi e'lon ketgach, agar 'Auto-izoh' yoniq bo'lsa, AI shu
     e'lon haqida qisqa izoh yozib, sozlangan guruhga yuboradi. asyncio.create_task
@@ -267,7 +289,7 @@ async def _maybe_auto_comment(context_text: str) -> None:
         group_chat_id = await db.get_ai_group_chat_id()
         if not group_chat_id:
             return
-        persona = await db.get_ai_persona()
+        persona = await _build_ai_system()
         prompt = (
             f"Hozirgina kanalga quyidagi e'lon qilindi:\n\n{context_text}\n\n"
             "Shu haqida muhokama guruhidagi a'zolarni qiziqtiradigan, qisqa "
@@ -1291,7 +1313,7 @@ async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
     tomonidan yoziladi. Rasm/video/audio - admin OLDINDAN yuborgan haqiqiy
     faylni (file_id orqali) joylaydi, faqat tarif matnini AI yozadi -
     AI hech qachon media generatsiya qilmaydi, faqat admin yuborgan faylni tarqatadi."""
-    persona = await db.get_ai_persona()
+    persona = await _build_ai_system(extra_rule=cfg.get("extra_rule"))
     prompt = cfg.get("prompt", "")
     target = cfg.get("target", "channel")
     ctype = cfg.get("content", "text")
@@ -1388,7 +1410,7 @@ async def _run_group_topics() -> None:
                     continue
             except Exception:
                 pass
-        persona = await db.get_ai_persona()
+        persona = await _build_ai_system()
         text = await ai_providers.generate(
             prompt=cfg.get("prompt", "Guruhda ishtirokchilar bilan qiziqarli mavzu och."), system=persona
         )
@@ -1447,6 +1469,7 @@ async def _aiauto_menu_text_and_kb():
         )],
         [InlineKeyboardButton(text="🎯 Guruh ID sozlash", callback_data="adm_set_groupid")],
         [InlineKeyboardButton(text="🎭 AI xarakterini sozlash", callback_data="adm_set_persona")],
+        [InlineKeyboardButton(text="📏 Umumiy qoida (barcha AI matnlari)", callback_data="adm_set_general_rule")],
         [InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_ai_menu")],
     ]
     return text, InlineKeyboardMarkup(inline_keyboard=rows)
@@ -1531,6 +1554,37 @@ async def adm_set_persona_received(message: Message, state: FSMContext):
     await db.set_ai_persona(message.text.strip())
     text, kb = await _aiauto_menu_text_and_kb()
     await message.answer(f"✅ AI xarakteri yangilandi.\n\n{text}", reply_markup=kb)
+
+
+@dp.callback_query(F.data == "adm_set_general_rule")
+async def adm_set_general_rule(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    current = await db.get_ai_general_rule()
+    await state.set_state(AdminGeneralRuleStates.waiting_rule)
+    current_display = html.escape(current) if current else "<i>(sozlanmagan)</i>"
+    await call.message.edit_text(
+        f"📏 Hozirgi umumiy qoida:\n\n{current_display}\n\n"
+        "Bu qoida xarakterdan (persona) farqli - BARCHA AI generatsiyalariga "
+        "(rejalashtirilgan postlar, auto-izoh, guruh mavzu boshlovchisi, real-vaqt javoblar) "
+        "qo'llaniladi. Masalan: <i>\"Har doim qisqaroq yoz va oxirida @ParadoksHub deb qo'sh\"</i>.\n\n"
+        "Yangisini yozing (butunlay almashtiradi), yoki tozalash uchun <code>-</code> yuboring:"
+    )
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminGeneralRuleStates.waiting_rule), F.text)
+async def adm_set_general_rule_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await state.clear()
+    new_rule = message.text.strip()
+    if new_rule == "-":
+        new_rule = ""
+    await db.set_ai_general_rule(new_rule)
+    text, kb = await _aiauto_menu_text_and_kb()
+    status = "tozalandi" if not new_rule else "yangilandi"
+    await message.answer(f"✅ Umumiy qoida {status}.\n\n{text}", reply_markup=kb)
 
 
 # ------------------------- ADMIN: REJALASHTIRILGAN POSTLAR -------------------------
@@ -1730,6 +1784,44 @@ async def adm_schedpost_target(call: CallbackQuery, state: FSMContext):
 async def adm_schedpost_prompt_received(message: Message, state: FSMContext):
     if not is_admin(message.from_user.id):
         return
+    await state.update_data(sp_prompt=message.text.strip())
+    await state.set_state(AdminSchedPostStates.waiting_extra_rule)
+    rows = [[
+        InlineKeyboardButton(text="➕ Ha, qo'shaman", callback_data="adm_schedpost_extra_yes"),
+        InlineKeyboardButton(text="⏭ Yo'q, kerak emas", callback_data="adm_schedpost_extra_no"),
+    ]]
+    await message.answer(
+        "📏 Shu POST uchungina qo'shimcha qoida qo'shmoqchimisiz? "
+        "(masalan: \"faqat 2 gapdan iborat bo'lsin\", \"emoji ishlatma\"). "
+        "Bu umumiy qoidaga QO'SHIMCHA ravishda ishlaydi, uni almashtirmaydi.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@dp.callback_query(F.data == "adm_schedpost_extra_no")
+async def adm_schedpost_extra_no(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await _finalize_schedpost(call.message, state, extra_rule=None)
+    await call.answer()
+
+
+@dp.callback_query(F.data == "adm_schedpost_extra_yes")
+async def adm_schedpost_extra_yes(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+    await call.message.edit_text("✍️ Qo'shimcha qoidani yozing:")
+    await call.answer()
+
+
+@dp.message(StateFilter(AdminSchedPostStates.waiting_extra_rule), F.text)
+async def adm_schedpost_extra_rule_received(message: Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    await _finalize_schedpost(message, state, extra_rule=message.text.strip())
+
+
+async def _finalize_schedpost(message: Message, state: FSMContext, extra_rule: str | None) -> None:
     data = await state.get_data()
     await state.clear()
     cfg = {
@@ -1737,10 +1829,12 @@ async def adm_schedpost_prompt_received(message: Message, state: FSMContext):
         "days": data.get("sp_days", "daily"),
         "content": data.get("sp_ctype", "text"),
         "target": data.get("sp_target", "channel"),
-        "prompt": message.text.strip(),
+        "prompt": data.get("sp_prompt", ""),
     }
     if data.get("sp_media_file_id"):
         cfg["media_file_id"] = data["sp_media_file_id"]
+    if extra_rule:
+        cfg["extra_rule"] = extra_rule
     rule_id = await db.add_ai_rule("scheduled_post", json.dumps(cfg, ensure_ascii=False))
     text, kb = await _schedposts_menu_text_and_kb()
     await message.answer(f"✅ Rejalashtirilgan post qo'shildi (#{rule_id}).\n\n{text}", reply_markup=kb)
@@ -1872,7 +1966,7 @@ async def ai_group_realtime_reply(message: Message):
         return
     _group_reply_last[message.chat.id] = now
 
-    persona = await db.get_ai_persona()
+    persona = await _build_ai_system()
     reply_text = await ai_providers.generate(prompt=message.text, system=persona)
     if reply_text:
         try:
