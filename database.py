@@ -128,6 +128,19 @@ async def init_db() -> None:
             """
         )
 
+        # AI faolligi statistikasi (rejalashtirilgan post, guruh mavzu
+        # boshlovchisi, auto-izoh, real-vaqt javob va guruhdagi umumiy
+        # xabar oqimi) - /admin > 📊 Statistika bo'limida ko'rsatish uchun.
+        await _conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS ai_stats_events (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
         # ----- Eski bazalarni yangi ustunlar bilan to'ldirish (migratsiya) -----
         await _add_column_if_missing("answers", "tournament_id", "INTEGER")
         await _add_column_if_missing("answers", "ref_num", "INTEGER")       # masalan: Rasmga oidlik raundida rasm raqami
@@ -665,3 +678,47 @@ async def update_ai_rule_last_run(rule_id: int, when: str) -> None:
     async with _lock:
         await _conn.execute("UPDATE ai_rules SET last_run_at = ? WHERE id = ?", (when, rule_id))
         await _conn.commit()
+
+
+# ------------------------- AI STATISTIKASI -------------------------
+
+async def log_ai_event(event_type: str) -> None:
+    """AI avtomatlashtirish voqeasini qayd qiladi (post yuborildi, izoh
+    yozildi, guruhda javob berdi va h.k.) - /admin > 📊 Statistika uchun."""
+    async with _lock:
+        await _conn.execute(
+            "INSERT INTO ai_stats_events (event_type, created_at) VALUES (?, ?)",
+            (event_type, datetime.now().isoformat(timespec="seconds")),
+        )
+        await _conn.commit()
+
+
+async def get_ai_event_counts(since_iso: str | None = None) -> dict[str, int]:
+    """Har bir event_type bo'yicha sonini qaytaradi (ixtiyoriy vaqtdan buyon).
+    Natija: {"scheduled_post_sent": 5, "auto_comment_sent": 2, ...}"""
+    async with _lock:
+        if since_iso:
+            cur = await _conn.execute(
+                "SELECT event_type, COUNT(*) as cnt FROM ai_stats_events WHERE created_at >= ? GROUP BY event_type",
+                (since_iso,),
+            )
+        else:
+            cur = await _conn.execute(
+                "SELECT event_type, COUNT(*) as cnt FROM ai_stats_events GROUP BY event_type"
+            )
+        rows = await cur.fetchall()
+        return {r["event_type"]: r["cnt"] for r in rows}
+
+
+async def get_total_users_count() -> int:
+    async with _lock:
+        cur = await _conn.execute("SELECT COUNT(*) as cnt FROM users")
+        row = await cur.fetchone()
+        return row["cnt"] if row else 0
+
+
+async def get_total_answers_count() -> int:
+    async with _lock:
+        cur = await _conn.execute("SELECT COUNT(*) as cnt FROM answers")
+        row = await cur.fetchone()
+        return row["cnt"] if row else 0

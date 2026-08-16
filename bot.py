@@ -20,7 +20,7 @@ import logging
 import os
 import re
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Awaitable, Callable, Dict
 
 import aiohttp
@@ -174,6 +174,7 @@ async def admin_panel_kb(tournament_active: bool, active_tournament: int, active
     )])
     rows.append([InlineKeyboardButton(text="📥 Excel yuklab olish", callback_data="adm_export")])
     rows.append([InlineKeyboardButton(text="👥 Foydalanuvchilar", callback_data="adm_users_0")])
+    rows.append([InlineKeyboardButton(text="📊 Statistika", callback_data="adm_stats")])
     rows.append([InlineKeyboardButton(text="🤖 AI provayderlar", callback_data="adm_ai_menu")])
     rows.append([InlineKeyboardButton(text="💾 Zaxira olish (qo'lda)", callback_data="adm_backup_now")])
 
@@ -298,6 +299,7 @@ async def _maybe_auto_comment(context_text: str) -> None:
         comment = await ai_providers.generate(prompt=prompt, system=persona)
         if comment:
             await bot.send_message(group_chat_id, comment)
+            await db.log_ai_event("auto_comment_sent")
     except Exception as e:
         logger.error(f"Auto-izoh yuborishda xatolik: {e}")
 
@@ -1162,6 +1164,55 @@ async def adm_msguser_send(message: Message, state: FSMContext):
 
 
 # ==================================================================
+#  ADMIN: STATISTIKA
+# ==================================================================
+
+EVENT_LABELS = {
+    "scheduled_post_sent": "📅 Rejalashtirilgan post yuborildi",
+    "group_topic_sent": "🗨 Guruh mavzu boshlovchisi yuborildi",
+    "auto_comment_sent": "💬 Auto-izoh yozildi",
+    "group_reply_sent": "🗣 Real-vaqt javob berildi",
+    "group_message_seen": "👥 Guruhdagi umumiy xabarlar",
+}
+
+
+@dp.callback_query(F.data == "adm_stats")
+async def adm_stats(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        return await call.answer("⛔️", show_alert=True)
+
+    total_users = await db.get_total_users_count()
+    total_answers = await db.get_total_answers_count()
+
+    now = datetime.now()
+    today_start = now.strftime("%Y-%m-%dT00:00:00")
+    week_start = (now - timedelta(days=7)).isoformat(timespec="seconds")
+
+    today_counts = await db.get_ai_event_counts(since_iso=today_start)
+    week_counts = await db.get_ai_event_counts(since_iso=week_start)
+    total_counts = await db.get_ai_event_counts()
+
+    lines = [
+        "📊 <b>Statistika</b>\n",
+        f"👤 Jami ro'yxatdan o'tgan foydalanuvchilar: <b>{total_users}</b>",
+        f"📝 Jami yuborilgan javoblar: <b>{total_answers}</b>\n",
+        "🤖 <b>AI faolligi</b> (bugun / oxirgi 7 kun / jami):",
+    ]
+    for event_type, label in EVENT_LABELS.items():
+        t = today_counts.get(event_type, 0)
+        w = week_counts.get(event_type, 0)
+        a = total_counts.get(event_type, 0)
+        lines.append(f"{label}: {t} / {w} / {a}")
+
+    if not await db.get_ai_group_chat_id():
+        lines.append("\n⚠️ Guruh ID sozlanmagan - guruh statistikasi to'planmayapti.")
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Orqaga", callback_data="adm_back")]])
+    await call.message.edit_text("\n".join(lines), reply_markup=kb)
+    await call.answer()
+
+
+# ==================================================================
 #  ADMIN: AI PROVAYDERLAR (kalitlarni /admin panelidan boshqarish)
 # ==================================================================
 
@@ -1363,6 +1414,7 @@ async def _fire_scheduled_post(rule_id: int, cfg: dict) -> None:
             await bot.send_audio(chat_id, media_file_id, caption=caption)
         else:
             await bot.send_message(chat_id, caption)
+        await db.log_ai_event("scheduled_post_sent")
     except Exception as e:
         logger.error(f"Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
         await _notify_admins(f"⚠️ Rejalashtirilgan post #{rule_id} yuborishda xatolik: {e}")
@@ -1421,6 +1473,7 @@ async def _run_group_topics() -> None:
         else:
             try:
                 await bot.send_message(group_chat_id, text)
+                await db.log_ai_event("group_topic_sent")
             except Exception as e:
                 logger.error(f"Guruh mavzu boshlovchisini yuborishda xatolik: {e}")
         await db.update_ai_rule_last_run(rule["id"], now.isoformat(timespec="seconds"))
@@ -1945,10 +1998,15 @@ async def ai_group_realtime_reply(message: Message):
     aks holda guruh AI-spam bo'lib qolar edi."""
     if message.from_user and message.from_user.is_bot:
         return  # boshqa botlar (yoki o'zimiz) bilan cheksiz sikl bo'lmasin
-    if not await db.is_ai_group_activity_enabled():
-        return
     group_chat_id = await db.get_ai_group_chat_id()
     if not group_chat_id or message.chat.id != group_chat_id:
+        return
+
+    # Guruh faolligi statistikasi uchun - AI real-vaqt javobi
+    # yoqilgan/o'chirilganidan qat'i nazar, umumiy xabar oqimini kuzatamiz.
+    await db.log_ai_event("group_message_seen")
+
+    if not await db.is_ai_group_activity_enabled():
         return
 
     mentioned = bool(BOT_USERNAME) and f"@{BOT_USERNAME.lower()}" in message.text.lower()
@@ -1971,6 +2029,7 @@ async def ai_group_realtime_reply(message: Message):
     if reply_text:
         try:
             await message.reply(reply_text)
+            await db.log_ai_event("group_reply_sent")
         except Exception as e:
             logger.error(f"Guruhda AI javob yuborishda xatolik: {e}")
 
